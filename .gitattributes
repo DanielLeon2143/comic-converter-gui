@@ -1,0 +1,2 @@
+# The patches are applied to the upstream sources (LF): keep them byte for byte.
+*.patch -text
