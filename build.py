@@ -7,18 +7,24 @@ and PyInstaller (pip install pyinstaller). The converter is built from ./go-comi
 
 The cgo build is used, as the pure Go one (-tags nocgo) needs libmupdf.dll at runtime.
 The MuPDF libs of go-fitz are built against UCRT, so gcc links with -mcrtdll=ucrt.
+
+The patches of ./patches are applied to a copy of the submodule, which stays the upstream code:
+- page-crops.patch: the -pagecrops option, crops chosen page by page in the GUI.
 """
 
+import io
 import os
 import shutil
 import struct
 import subprocess
 import sys
+import tarfile
 import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "go-comic-converter"
+PATCHES = ROOT / "patches"
 BUILD = ROOT / "build"
 DIST = ROOT / "dist"
 
@@ -35,6 +41,32 @@ def tool(env_name, name):
     return path
 
 
+def patched_source():
+    """The commit of the submodule, exported to build/src, with the patches applied."""
+    src = BUILD / "src"
+    shutil.rmtree(src, ignore_errors=True)
+    if (SRC / ".git").exists():
+        src.mkdir(parents=True)
+        archive = subprocess.run(["git", "-C", str(SRC), "archive", "--format=tar", "HEAD"],
+                                 check=True, capture_output=True).stdout
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            tar.extractall(src, filter="data")
+    else:  # from the full-source zip of a release: no git checkout, the folder is the code
+        shutil.copytree(SRC, src)
+    # A repository of its own: inside this one, git apply would skip the paths (they'd be outside build/src).
+    run(["git", "init", "-q"], cwd=src)
+    for patch in sorted(PATCHES.glob("*.patch")):
+        run(["git", "apply", "--whitespace=nowarn", patch], cwd=src)
+    return src
+
+
+def check_converter(exe):
+    """The patches made it into the converter: the crop boxes of the GUI need -pagecrops."""
+    out = subprocess.run([str(exe), "-help", "-ignore-config"], capture_output=True, text=True)
+    if "-pagecrops" not in out.stdout + out.stderr:
+        sys.exit("The converter was built without the page-crops patch")
+
+
 def build_converter():
     go, cc = tool("GO", "go"), tool("CC", "gcc")
     env = dict(os.environ, CGO_ENABLED="1", CC=cc, GOTOOLCHAIN="local",
@@ -42,7 +74,8 @@ def build_converter():
     # gcc runs its helpers (as, ld) from its own folder.
     env["PATH"] = str(Path(cc).parent) + os.pathsep + env["PATH"]
     out = BUILD / "go-comic-converter.exe"
-    run([go, "build", "-trimpath", "-ldflags", "-s -w", "-o", out, "."], cwd=SRC, env=env)
+    run([go, "build", "-trimpath", "-ldflags", "-s -w", "-o", out, "."], cwd=patched_source(), env=env)
+    check_converter(out)
     return out
 
 

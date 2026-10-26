@@ -27,9 +27,10 @@ CONVERTER_EXTS = (".cbr", ".rar", ".pdf")  # read by go-comic-converter only
 
 
 class Page:
-    def __init__(self, label, load):
-        self.label = label  # shown under the thumbnail
-        self.load = load    # returns the bytes of the image
+    def __init__(self, label, load, source_id=None):
+        self.label = label          # shown under the thumbnail
+        self.load = load            # returns the bytes of the image
+        self.source_id = source_id  # index of the page in the source (the converter's task id), None for a title page
 
 
 # ---------- order of the pages ----------
@@ -93,13 +94,14 @@ def source_pages(path, sort_mode):
     if os.path.isdir(path):
         root = os.path.normpath(path)
         images = [os.path.join(d, f) for d, _, files in os.walk(root) for f in files if _is_image(f)]
-        return [Page(os.path.relpath(p, root), functools.partial(_read_file, p))
-                for p in sort_like_converter(images, sort_mode)]
+        return [Page(os.path.relpath(p, root), functools.partial(_read_file, p), i)
+                for i, p in enumerate(sort_like_converter(images, sort_mode))]
     ext = os.path.splitext(path)[1].lower()
     if ext in ZIP_EXTS:
         with zipfile.ZipFile(path) as z:
             names = [i.filename for i in z.infolist() if not i.is_dir() and _is_image(i.filename)]
-        return [Page(n, functools.partial(_read_zip, path, n)) for n in sort_like_converter(names, sort_mode)]
+        return [Page(n, functools.partial(_read_zip, path, n), i)
+                for i, n in enumerate(sort_like_converter(names, sort_mode))]
     return None
 
 
@@ -127,18 +129,67 @@ def epub_pages(epub):
             i, h = re.search(r'\bid="([^"]+)"', tag), re.search(r'\bhref="([^"]+)"', tag)
             if i and h:
                 hrefs[i.group(1)] = posixpath.normpath(posixpath.join(base, h.group(1)))
+        spreads = dict(re.findall(r'<itemref\b[^>]*\bidref="([^"]+)"[^>]*properties="page-spread-(left|right)"', text))
         pages = []
+        backgrounds = {}  # stylesheet -> background color of the pages
         for ref in re.findall(r'<itemref\b[^>]*\bidref="([^"]+)"', text):
             page = hrefs.get(ref)
             if not page:
                 continue
             html = z.read(page).decode("utf-8", "replace")
-            m = re.search(r'(?:src|xlink:href|href)="([^"]+\.(?:jpe?g|png|webp|jxl))"', html, re.I)
-            if m:
-                img = posixpath.normpath(posixpath.join(posixpath.dirname(page), m.group(1)))
-                label = "Title page" if "title" in ref.lower() else f"Page {len(pages) + 1}"
-                pages.append(Page(label, functools.partial(_read_zip, epub, img)))
+            here = posixpath.dirname(page)
+            # A page is a screen (the viewport) with its images placed in it: a big page is stored as
+            # several tiles. The page is drawn the way the e-reader shows it, margins included.
+            tiles = []
+            for tag in re.findall(r"<img\b[^>]*>", html):
+                src = re.search(r'\bsrc="([^"]+)"', tag)
+                if src:
+                    style = dict(re.findall(r"(left|top|width|height)\s*:\s*(-?\d+(?:\.\d+)?)px", tag))
+                    tiles.append((posixpath.normpath(posixpath.join(here, src.group(1))),
+                                  {k: float(v) for k, v in style.items()}))
+            if not tiles:
+                m = re.search(r'(?:xlink:href|href)="([^"]+\.(?:jpe?g|png|webp|jxl))"', html, re.I)
+                if not m:
+                    continue
+                tiles = [(posixpath.normpath(posixpath.join(here, m.group(1))), {})]
+            vp = re.search(r'name="viewport"[^>]*content="width=(\d+),\s*height=(\d+)"', html)
+            css = re.search(r'<link\b[^>]*href="([^"]+\.css)"', html)
+            css = posixpath.normpath(posixpath.join(here, css.group(1))) if css else None
+            if css not in backgrounds:
+                try:
+                    bg = re.search(r"body\s*{[^}]*background(?:-color)?\s*:\s*(#[0-9a-fA-F]{6})", z.read(css).decode())
+                except (KeyError, TypeError):
+                    bg = None
+                backgrounds[css] = bg.group(1) if bg else "#FFFFFF"
+            sid = re.match(r"page_(\d+)_p\d+", ref)
+            label = "Title page" if "title" in ref.lower() else f"Page {len(pages) + 1}"
+            if ref in spreads:
+                label += " ◧" if spreads[ref] == "left" else " ◨"  # side of the spread on the e-reader
+            viewport = (int(vp.group(1)), int(vp.group(2))) if vp else None
+            pages.append(Page(label, functools.partial(_render_page, epub, viewport, backgrounds[css], tiles),
+                              int(sid.group(1)) if sid else None))
     return pages
+
+
+def _render_page(epub, viewport, background, tiles):
+    """The page as the e-reader shows it: its viewport, its background, its images where it places them."""
+    with zipfile.ZipFile(epub) as z:
+        images = [(Image.open(io.BytesIO(z.read(name))).convert("RGB"), pos) for name, pos in tiles]
+    placed = []
+    for im, p in images:
+        w, h = round(p.get("width", im.width)), round(p.get("height", im.height))
+        placed.append((im if (w, h) == im.size else im.resize((max(w, 1), max(h, 1))),
+                       round(p.get("left", 0)), round(p.get("top", 0))))
+    if viewport:
+        size = viewport
+    else:  # no viewport: just the images
+        size = (max(x + im.width for im, x, _ in placed), max(y + im.height for im, _, y in placed))
+    out = Image.new("RGB", size, background)
+    for im, x, y in placed:
+        out.paste(im, (x, y))
+    buf = io.BytesIO()
+    out.save(buf, "PNG", compress_level=1)
+    return buf.getvalue()
 
 
 # ---------- converter ----------

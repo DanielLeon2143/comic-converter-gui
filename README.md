@@ -32,7 +32,11 @@ Advanced tab.
     title page, grayscale, contrast, crop, and *Convert all*.
   - **Comics** list with the status and the EPUB of each one, an overall progress bar, and the log.
     Made for bulk conversions: hundreds of comics, *Clear finished*, *Open output folder*.
-- **Settings** (top right): every option of go-comic-converter, in tabs.
+- **Crop box per page**: click a page in the preview and drag a rectangle around what to keep (e.g. the
+  front of a wraparound cover, which is otherwise split into back + front). That page becomes exactly the
+  rectangle, as one page, never split. Remembered per comic in `~/.go-comic-converter-gui-crops.json`.
+- **Settings** (top right): every option of go-comic-converter, in tabs. Every option has a **?** that
+  explains it, and **Help** opens a tutorial (also shown at the first start).
 - Skeuomorphic look, light and dark (switch at the top right, or Settings > Advanced > Appearance).
 - Options are remembered in `~/.go-comic-converter-gui.json`. By default the tool's own saved
   config is ignored (`-ignore-config`), so the window is the only source of options.
@@ -57,7 +61,10 @@ Notes:
 - The MuPDF libraries shipped by go-fitz are built against UCRT, so the build links with
   `-mcrtdll=ucrt` (otherwise: `undefined reference to __intrinsic_setjmpex`).
 
-To update the converter: `git -C go-comic-converter pull`, then `python build.py`.
+`build.py` applies the patches of `patches/` to a copy of the submodule (which stays the upstream code):
+`page-crops.patch` adds the `-pagecrops` option used by the crop boxes.
+
+To update the converter: `git -C go-comic-converter pull`, then `python build.py` (check the patches still apply).
 
 ## License
 

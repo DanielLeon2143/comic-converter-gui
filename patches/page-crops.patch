@@ -1,0 +1,284 @@
+diff --git a/internal/pkg/converter/converter.go b/internal/pkg/converter/converter.go
+index 8ba5b00..3c97165 100644
+--- a/internal/pkg/converter/converter.go
++++ b/internal/pkg/converter/converter.go
+@@ -181,6 +181,7 @@ func (c *Converter) InitParse() {
+ 	c.AddIntParam(&c.Options.TitlePage, "titlepage", c.Options.TitlePage, "Title page\n0 = never\n1 = always\n2 = only if epub is split")
+ 	c.AddReversibleBoolParam(&c.Options.CoverCaption, "covercaption", c.Options.CoverCaption, "Set cover caption when the epub is split")
+ 	c.AddStringParam(&c.Options.Font, "font", c.Options.Font, "Path to a TrueType font (.ttf) for the cover caption and title page. Default: embedded Literata")
++	c.AddStringParam(&c.Options.PageCropsFile, "pagecrops", "", "Path to a JSON file of crops chosen page by page: {\"<page index>\": [x0, y0, x1, y1], \"*\": [...]}\n  fractions (0 to 1) of the source page, 0 = first page in the sort order, \"*\" = the other pages\n  a page with a crop is this rectangle, as one page: never split, not auto-cropped")
+ 
+ 	c.AddSection("Default config")
+ 	c.AddBoolParam(&c.Options.Show, "show", false, "Show your default parameters")
+@@ -547,6 +548,15 @@ func (c *Converter) Validate() error {
+ 		return errors.New("crop limit should be between 0 and 100")
+ 	}
+ 
++	// page crops
++	if c.Options.PageCropsFile != "" {
++		crops, err := epuboptions.LoadPageCrops(c.Options.PageCropsFile)
++		if err != nil {
++			return err
++		}
++		c.Options.Image.PageCrops = crops
++	}
++
+ 	return nil
+ }
+ 
+diff --git a/internal/pkg/converter/options.go b/internal/pkg/converter/options.go
+index 56ff503..b762f54 100644
+--- a/internal/pkg/converter/options.go
++++ b/internal/pkg/converter/options.go
+@@ -158,6 +158,11 @@ func (o *Options) ShowConfig() string {
+ 	}
+ 
+ 	zoom := utils.FloatToString(o.Image.ZoomFactor(), -1)
++
++	pageCrops := utils.IntToString(o.Image.PageCrops.Len()) + " page(s)"
++	if o.Image.PageCrops.Default != nil {
++		pageCrops += ", and a default for the others"
++	}
+ 	if o.Image.Zoom == 0 {
+ 		zoom += " (profile)"
+ 	}
+@@ -245,6 +250,7 @@ func (o *Options) ShowConfig() string {
+ 		{"Title page", titlePage, true},
+ 		{"Cover caption", o.CoverCaption, o.LimitMb != 0},
+ 		{"Font", font, true},
++		{"Page crops", pageCrops, o.Image.Format != "copy" && o.PageCropsFile != ""},
+ 	} {
+ 		if v.Condition {
+ 			if bv, ok := v.Value.(bool); ok {
+diff --git a/internal/pkg/epubimageprocessor/processor.go b/internal/pkg/epubimageprocessor/processor.go
+index 1b24f5e..90cba25 100644
+--- a/internal/pkg/epubimageprocessor/processor.go
++++ b/internal/pkg/epubimageprocessor/processor.go
+@@ -301,6 +301,13 @@ func (e ePUBImageProcessor) transformImage(input task, part int, right bool) epu
+ 	src := input.Image
+ 	srcBounds := src.Bounds()
+ 
++	// A crop chosen for the page (-pagecrops) is the page: no auto crop, and never a double page.
++	pageCrop, hasPageCrop := e.Image.PageCrops.For(input.Id)
++	hasPageCrop = hasPageCrop && part == 0 && !e.Image.WebtoonMode()
++	if hasPageCrop {
++		g.Add(gift.Crop(pageCrop.Rect(srcBounds)))
++	}
++
+ 	// When the split halves don't need to keep the same aspect ratio,
+ 	// we first cut, then crop.
+ 	if part > 0 && !e.Image.KeepSplitDoublePageAspect {
+@@ -308,7 +315,7 @@ func (e ePUBImageProcessor) transformImage(input task, part int, right bool) epu
+ 	}
+ 
+ 	// Lookup for margin if crop is enable or if we want to remove blank image
+-	if e.Image.CropPages() || e.Image.RemoveBlankPages() {
++	if !hasPageCrop && (e.Image.CropPages() || e.Image.RemoveBlankPages()) {
+ 		f := epubimagefilters.AutoCrop(
+ 			src,
+ 			g.Bounds(src.Bounds()),
+@@ -340,7 +347,7 @@ func (e ePUBImageProcessor) transformImage(input task, part int, right bool) epu
+ 	// Original && Cropped version need to landscape oriented
+ 	// Only part 0 can be a double page
+ 	// A page of a webtoon is never a double page, whatever the aspect ratio of the view
+-	isDoublePage := part == 0 && !e.Image.WebtoonMode() && srcBounds.Dx() > srcBounds.Dy() && dstBounds.Dx() > dstBounds.Dy()
++	isDoublePage := part == 0 && !hasPageCrop && !e.Image.WebtoonMode() && srcBounds.Dx() > srcBounds.Dy() && dstBounds.Dx() > dstBounds.Dy()
+ 
+ 	if e.Image.RotateDoublePage() && isDoublePage {
+ 		g.Add(gift.Rotate90())
+diff --git a/pkg/epuboptions/epub_options.go b/pkg/epuboptions/epub_options.go
+index 6e5589c..9466b21 100644
+--- a/pkg/epuboptions/epub_options.go
++++ b/pkg/epuboptions/epub_options.go
+@@ -18,6 +18,7 @@ type EPUBOptions struct {
+ 	TitlePage                  int            `yaml:"title_page" json:"title_page"`
+ 	CoverCaption               bool           `yaml:"cover_caption" json:"cover_caption"`
+ 	Font                       string         `yaml:"font" json:"font"`
++	PageCropsFile              string         `yaml:"-" json:"page_crops_file,omitempty"`
+ 	TrueTypeFont               *truetype.Font `yaml:"-" json:"-"`
+ 	LimitMb                    int            `yaml:"limit_mb" json:"limit_mb"`
+ 	StripFirstDirectoryFromToc bool           `yaml:"strip_first_directory" json:"strip_first_directory"`
+diff --git a/pkg/epuboptions/image.go b/pkg/epuboptions/image.go
+index cb8747e..18bad34 100644
+--- a/pkg/epuboptions/image.go
++++ b/pkg/epuboptions/image.go
+@@ -80,6 +80,8 @@ type Image struct {
+ 	Features Features `yaml:"-" json:"features"`
+ 	// Device is the device family of the profile, it comes only from the profile.
+ 	Device DeviceType `yaml:"-" json:"device"`
++	// PageCrops are the crops chosen page by page, loaded from the -pagecrops file.
++	PageCrops PageCrops `yaml:"-" json:"-"`
+ }
+ 
+ // doublePageMode the double page mode in use: the landscape only mode doesn't support the rotation, the double page is split.
+diff --git a/pkg/epuboptions/page_crops.go b/pkg/epuboptions/page_crops.go
+new file mode 100644
+index 0000000..99c13b3
+--- /dev/null
++++ b/pkg/epuboptions/page_crops.go
+@@ -0,0 +1,81 @@
++package epuboptions
++
++import (
++	"encoding/json"
++	"fmt"
++	"image"
++	"math"
++	"os"
++	"strconv"
++)
++
++// PageCrop is the part of a page kept, chosen by hand: x0, y0, x1, y1 in fractions (0 to 1) of the source page.
++type PageCrop [4]float64
++
++// PageCrops are the crops chosen page by page (-pagecrops).
++// A page with a crop is this rectangle, as one page: it is never split, and not auto-cropped.
++type PageCrops struct {
++	// Pages by index of the page in the source, in the sort order (0 = first page).
++	Pages map[int]PageCrop
++	// Default is used for the pages without their own crop, when set.
++	Default *PageCrop
++}
++
++// For gives the crop of the page, if it has one.
++func (p PageCrops) For(id int) (PageCrop, bool) {
++	if c, ok := p.Pages[id]; ok {
++		return c, true
++	}
++	if p.Default != nil {
++		return *p.Default, true
++	}
++	return PageCrop{}, false
++}
++
++// Len is the number of pages with their own crop.
++func (p PageCrops) Len() int {
++	return len(p.Pages)
++}
++
++// Rect is the crop in pixels of a page of the given bounds, at least 1x1.
++func (c PageCrop) Rect(b image.Rectangle) image.Rectangle {
++	w, h := float64(b.Dx()), float64(b.Dy())
++	r := image.Rect(
++		b.Min.X+int(math.Round(c[0]*w)), b.Min.Y+int(math.Round(c[1]*h)),
++		b.Min.X+int(math.Round(c[2]*w)), b.Min.Y+int(math.Round(c[3]*h)),
++	).Intersect(b)
++	if r.Dx() < 1 || r.Dy() < 1 {
++		return image.Rect(r.Min.X, r.Min.Y, r.Min.X+1, r.Min.Y+1).Intersect(b)
++	}
++	return r
++}
++
++// LoadPageCrops reads a JSON file {"<page index>": [x0, y0, x1, y1], "*": [x0, y0, x1, y1]},
++// "*" being the crop of the pages without their own.
++func LoadPageCrops(path string) (PageCrops, error) {
++	crops := PageCrops{Pages: map[int]PageCrop{}}
++	data, err := os.ReadFile(path)
++	if err != nil {
++		return crops, fmt.Errorf("page crops: %w", err)
++	}
++	var raw map[string]PageCrop
++	if err := json.Unmarshal(data, &raw); err != nil {
++		return crops, fmt.Errorf("page crops %s: %w", path, err)
++	}
++	for key, c := range raw {
++		if c[0] < 0 || c[1] < 0 || c[2] > 1 || c[3] > 1 || c[0] >= c[2] || c[1] >= c[3] {
++			return crops, fmt.Errorf("page crops %s: crop of %q should be x0, y0, x1, y1 between 0 and 1, with x0 < x1 and y0 < y1", path, key)
++		}
++		if key == "*" {
++			d := c
++			crops.Default = &d
++			continue
++		}
++		id, err := strconv.Atoi(key)
++		if err != nil || id < 0 {
++			return crops, fmt.Errorf("page crops %s: %q is not a page index (0 = first page) or \"*\"", path, key)
++		}
++		crops.Pages[id] = c
++	}
++	return crops, nil
++}
+diff --git a/pkg/epuboptions/page_crops_test.go b/pkg/epuboptions/page_crops_test.go
+new file mode 100644
+index 0000000..02cc717
+--- /dev/null
++++ b/pkg/epuboptions/page_crops_test.go
+@@ -0,0 +1,78 @@
++package epuboptions
++
++import (
++	"image"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func writeCrops(t *testing.T, content string) string {
++	t.Helper()
++	p := filepath.Join(t.TempDir(), "crops.json")
++	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	return p
++}
++
++func TestLoadPageCrops(t *testing.T) {
++	crops, err := LoadPageCrops(writeCrops(t, `{"0": [0.5, 0, 1, 1], "3": [0, 0.1, 0.9, 1], "*": [0, 0, 1, 1]}`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if crops.Len() != 2 {
++		t.Errorf("want 2 pages, got %d", crops.Len())
++	}
++	if c, ok := crops.For(0); !ok || c != (PageCrop{0.5, 0, 1, 1}) {
++		t.Errorf("page 0: %v %v", c, ok)
++	}
++	if c, ok := crops.For(7); !ok || c != (PageCrop{0, 0, 1, 1}) {
++		t.Errorf("page 7 should use the default: %v %v", c, ok)
++	}
++}
++
++func TestPageCropsWithoutDefault(t *testing.T) {
++	crops, err := LoadPageCrops(writeCrops(t, `{"1": [0, 0, 0.5, 1]}`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, ok := crops.For(0); ok {
++		t.Error("page 0 has no crop")
++	}
++	var none PageCrops
++	if _, ok := none.For(0); ok {
++		t.Error("no crops at all")
++	}
++}
++
++func TestLoadPageCropsErrors(t *testing.T) {
++	for name, content := range map[string]string{
++		"not json":    `{"0": [0, 0`,
++		"outside":     `{"0": [0, 0, 1.5, 1]}`,
++		"empty":       `{"0": [0.5, 0, 0.5, 1]}`,
++		"negative":    `{"0": [-0.1, 0, 1, 1]}`,
++		"bad key":     `{"cover": [0, 0, 1, 1]}`,
++		"negative id": `{"-1": [0, 0, 1, 1]}`,
++	} {
++		if _, err := LoadPageCrops(writeCrops(t, content)); err == nil {
++			t.Errorf("%s: an error was expected", name)
++		}
++	}
++	if _, err := LoadPageCrops(filepath.Join(t.TempDir(), "missing.json")); err == nil {
++		t.Error("missing file: an error was expected")
++	}
++}
++
++func TestPageCropRect(t *testing.T) {
++	b := image.Rect(0, 0, 3000, 2000)
++	if r := (PageCrop{0.5, 0, 1, 1}).Rect(b); r != image.Rect(1500, 0, 3000, 2000) {
++		t.Errorf("right half: %v", r)
++	}
++	if r := (PageCrop{0.25, 0.1, 0.75, 0.9}).Rect(image.Rect(100, 100, 500, 300)); r != image.Rect(200, 120, 400, 280) {
++		t.Errorf("offset bounds: %v", r)
++	}
++	if r := (PageCrop{0.5, 0.5, 0.5001, 0.5001}).Rect(image.Rect(0, 0, 10, 10)); r.Dx() < 1 || r.Dy() < 1 {
++		t.Errorf("at least 1x1: %v", r)
++	}
++}

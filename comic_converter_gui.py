@@ -4,6 +4,7 @@ Runs the go-comic-converter command line tool with the options picked in the win
 over a queue of comics, and follows its progress through its -json output.
 """
 
+import hashlib
 import json
 import os
 import queue
@@ -19,11 +20,14 @@ from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import preview
+from help_texts import HELP, SETTINGS_TABS, TUTORIAL
 from theme import Theme, set_title_bar_dark, windows_dark_mode
 
 APP_NAME = "Comic Converter"
 EXE_NAME = "go-comic-converter.exe" if os.name == "nt" else "go-comic-converter"
 SETTINGS_FILE = Path.home() / ".go-comic-converter-gui.json"
+# Crops drawn page by page: {comic path: {page index: [x0, y0, x1, y1]}}, fractions of the source page.
+CROPS_FILE = Path.home() / ".go-comic-converter-gui-crops.json"
 INPUT_TYPES = [("Comics", "*.cbz *.zip *.cbr *.rar *.pdf"), ("All files", "*.*")]
 ARCHIVE_EXTS = (".cbz", ".zip", ".cbr", ".rar", ".pdf")
 # Where PyInstaller unpacks the bundled files, when running as an EXE.
@@ -402,6 +406,9 @@ class App(tk.Tk):
         self.proc = None
         self.stop_requested = False
         self.comboboxes = []
+        self.help_icons = []        # the ? icons, recolored with the theme
+        self.tutorial = None
+        self.tutorial_seen = True   # set from the settings: the tutorial opens once, at the first start
         # Preview: a token per load, so the results of an older load are dropped.
         self.pv_mode = "original"
         self.pv_token = 0
@@ -412,7 +419,12 @@ class App(tk.Tk):
         self.pv_cache = {}    # (input, arguments) -> EPUB written for the preview
         self.pv_tmp = tempfile.mkdtemp(prefix="comic-converter-preview-")
         self.pv_note = ""
+        self.pv_whole = False  # the pages shown are the whole source pages: crops can be drawn on them
+        self.pv_tiles = {}     # index -> (x, y) of the thumbnail
         self.viewer = None
+        self.pending_viewer = None  # source page to open in the viewer once the Original preview is loaded
+        self.page_crops = self._load_crops()
+        self.crop_support = {}  # converter path -> knows -pagecrops
         self.last_dir = None  # where the folder dialog opens next
         self.theme = Theme(self)
         self.theme.apply(self._saved_theme_is_dark())  # draws the images the widgets are built with
@@ -421,9 +433,16 @@ class App(tk.Tk):
         self._load_settings()
         self._on_profile_change()
         self._apply_theme()
+        # The Converted preview follows the options: it's redone a moment after a change.
+        self.pv_change_after = None
+        for var in self.vars.values():
+            var.trace_add("write", lambda *_: self._on_option_change())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll_events)
         self.after(200, self._check_exe)
+        if not self.tutorial_seen:  # first start: how to use the app
+            self.tutorial_seen = True
+            self.after(700, self._show_tutorial)
         if os.name == "nt":
             try:
                 self.file_drop = FileDrop(self, lambda paths: self.events.put(("drop", paths)))
@@ -488,6 +507,63 @@ class App(tk.Tk):
         ttk.Label(bar, text="Changes apply right away, and are remembered.",
                   style="Backdrop.TLabel").pack(side="left")
         ttk.Button(bar, text="Done", style="Accent.TButton", command=w.withdraw).pack(side="right", ipadx=10)
+
+    def _show_tutorial(self):
+        """How to use the app, with every option explained (the texts of the ? icons)."""
+        t = self.tutorial
+        if not (t and t.winfo_exists()):
+            t = self.tutorial = tk.Toplevel(self)
+            t.title(f"{APP_NAME} - Help")
+            t.geometry("760x820")
+            t.minsize(520, 400)
+            frame = ttk.Frame(t, padding=12, style="Backdrop.TFrame")
+            frame.pack(fill="both", expand=True)
+            card, body = self._card(frame)
+            card.pack(fill="both", expand=True)
+            body.columnconfigure(0, weight=1)
+            body.rowconfigure(0, weight=1)
+            t.text = tk.Text(body, wrap="word", relief="flat", borderwidth=0, highlightthickness=0, padx=16, pady=10,
+                             font=("Segoe UI", 10), cursor="arrow", spacing1=2, spacing3=4)
+            t.text.grid(row=0, column=0, sticky="nsew")
+            sb = ttk.Scrollbar(body, orient="vertical", command=t.text.yview)
+            sb.grid(row=0, column=1, sticky="ns")
+            t.text.configure(yscrollcommand=sb.set)
+            bar = ttk.Frame(frame, style="Backdrop.TFrame")
+            bar.pack(fill="x", pady=(10, 0))
+            ttk.Label(bar, text="Hover or click the ? next to an option to read its explanation.",
+                      style="Backdrop.TLabel").pack(side="left")
+            ttk.Button(bar, text="Close", style="Accent.TButton", command=t.destroy).pack(side="right", ipadx=10)
+            t.bind("<Escape>", lambda e: t.destroy())
+            self._fill_tutorial(t.text)
+            self._style_tutorial()
+        t.deiconify()
+        t.lift()
+        t.focus_set()
+        set_title_bar_dark(t, self.theme.p["dark"])
+
+    def _fill_tutorial(self, text):
+        text.insert("end", "How to use Comic Converter\n", "h1")
+        for heading, paragraphs in TUTORIAL:
+            text.insert("end", heading + "\n", "h2")
+            for para in paragraphs:
+                if para.startswith("options:"):
+                    keys = dict(SETTINGS_TABS)[para.split(":", 1)[1]]
+                    for key in keys:
+                        title, body = HELP[key]
+                        text.insert("end", title, "opt")
+                        text.insert("end", f"  {body}\n", "body")
+                else:
+                    text.insert("end", para + "\n", "body")
+        text.configure(state="disabled")
+
+    def _style_tutorial(self):
+        p, text = self.theme.p, self.tutorial.text
+        text.configure(background=p["card"], foreground=p["text"], selectbackground=p["select"],
+                       selectforeground=p["select_text"])
+        text.tag_configure("h1", font=("Segoe UI Semibold", 17), spacing3=6, foreground=p["text"])
+        text.tag_configure("h2", font=("Segoe UI Semibold", 12), spacing1=14, spacing3=4, foreground=p["select"])
+        text.tag_configure("opt", font=("Segoe UI Semibold", 10), foreground=p["text"])
+        text.tag_configure("body", foreground=p["text"], lmargin1=0, lmargin2=0)
 
     def _show_settings(self):
         w = self.settings_win
@@ -573,9 +649,12 @@ class App(tk.Tk):
         c.create_text(0, y, text="☾", font=("Segoe UI Symbol", 13), anchor="e", tags=("right", "moon"))
         c.create_text(0, y, text="⚙  Settings", font=("Segoe UI Semibold", 11), anchor="e",
                       tags=("right", "settings", "settings_text"))
+        c.create_text(0, y, text="?  Help", font=("Segoe UI Semibold", 11), anchor="e",
+                      tags=("right", "help", "help_text"))
         c.tag_bind("switch", "<Button-1>", lambda e: self._toggle_dark())
         c.tag_bind("settings", "<Button-1>", lambda e: self._show_settings())
-        for tag in ("switch", "settings"):
+        c.tag_bind("help", "<Button-1>", lambda e: self._show_tutorial())
+        for tag in ("switch", "settings", "help"):
             c.tag_bind(tag, "<Enter>", lambda e: c.configure(cursor="hand2"))
             c.tag_bind(tag, "<Leave>", lambda e: c.configure(cursor=""))
         c.bind("<Configure>", lambda e: self._place_header())
@@ -588,6 +667,7 @@ class App(tk.Tk):
         c.coords("switch", w - 38, y)
         c.coords("sun", w - 44 - sw, y - 1)
         c.coords("settings_text", w - 44 - sw - 44, y)
+        c.coords("help_text", w - 44 - sw - 44 - 120, y)
 
     def _redraw_header(self):
         p = self.theme.p
@@ -607,6 +687,7 @@ class App(tk.Tk):
         c.itemconfigure("moon", fill=p["title"] if p["dark"] else p["subtitle"])
         c.itemconfigure("switch", image=self.theme.photos["switch_on" if p["dark"] else "switch_off"])
         c.itemconfigure("settings_text", fill=p["title"])
+        c.itemconfigure("help_text", fill=p["title"])
         self._place_header()
 
     def _card(self, parent, title=None, hint=None):
@@ -652,7 +733,12 @@ class App(tk.Tk):
         self.pv_canvas.configure(background=p["card"])
         self._layout_thumbs()
         self._style_mode_buttons()
-        for win in (self.settings_win, self.viewer):
+        for icon in self.help_icons:
+            icon.configure(background=p["card"])
+            icon.itemconfigure("dot", fill=p["select"], outline=p["accent_border"])
+        if self.tutorial and self.tutorial.winfo_exists():
+            self._style_tutorial()
+        for win in (self.settings_win, self.viewer, self.tutorial):
             if win and win.winfo_exists():
                 win.configure(background=p["bg"])
                 if win.winfo_viewable():
@@ -681,12 +767,14 @@ class App(tk.Tk):
         self.queue_count = ttk.Label(bar, style="Muted.TLabel")
         self.queue_count.pack(side="right", padx=(0, 12))
 
-        cols = ("input", "status", "output")
+        cols = ("input", "crops", "status", "output")
         self.tree = ttk.Treeview(box, columns=cols, show="headings", height=6, selectmode="extended")
         self.tree.heading("input", text="Comic (folder or file)")
+        self.tree.heading("crops", text="✂")
         self.tree.heading("status", text="Status")
         self.tree.heading("output", text="EPUB")
-        self.tree.column("input", width=520)
+        self.tree.column("input", width=500)
+        self.tree.column("crops", width=50, anchor="center", stretch=False)
         self.tree.column("status", width=130, anchor="center", stretch=False)
         self.tree.column("output", width=300)
         self.tree.grid(row=1, column=0, sticky="nsew")
@@ -731,12 +819,11 @@ class App(tk.Tk):
         box.columnconfigure(1, weight=1)
         rows = [0]
 
-        def row(label, widget, tip=None):
+        def row(label, widget, key):
             r = rows[0]
             ttk.Label(box, text=label).grid(row=r, column=0, sticky="w", padx=(0, 10), pady=2)
             widget.grid(row=r, column=1, sticky="ew", pady=2)
-            if tip:
-                Tooltip(widget, tip)
+            self._help_icon(box, key).grid(row=r, column=2, padx=(6, 0))
             rows[0] += 1
 
         def combo(key, values, command=None):
@@ -751,26 +838,27 @@ class App(tk.Tk):
         self.vars["output_dir"] = tk.StringVar()
         ttk.Entry(out, textvariable=self.vars["output_dir"], width=10).grid(row=0, column=0, sticky="ew")
         ttk.Button(out, text="…", width=3, command=self._pick_output).grid(row=0, column=1, padx=(4, 0))
-        row("Output folder", out, "Where the EPUBs go. Empty: next to each comic.")
-        row("Device", combo("profile", PROFILE_LABELS, self._on_profile_change), "The e-reader you will read on.")
-        row("Reading mode", combo("mode", [l for _, l in CHOICES["mode"]], self._on_mode_change))
-        row("Image format", combo("format", [l for _, l in CHOICES["format"]]))
+        row("Output folder", out, "output_dir")
+        row("Device", combo("profile", PROFILE_LABELS, self._on_profile_change), "profile")
+        row("Reading mode", combo("mode", [l for _, l in CHOICES["mode"]], self._on_mode_change), "mode")
+        row("Image format", combo("format", [l for _, l in CHOICES["format"]]), "format")
         q = ttk.Frame(box)
         ttk.Scale(q, from_=1, to=100, variable=self.vars["quality"],
                   command=lambda x: self.vars["quality"].set(round(float(x)))).pack(side="left", fill="x", expand=True)
         ttk.Spinbox(q, from_=1, to=100, textvariable=self.vars["quality"], width=4).pack(side="left", padx=(6, 0))
-        row("Quality", q)
+        row("Quality", q, "quality")
         row("Split every (MB)", ttk.Spinbox(box, from_=0, to=10000, increment=10, textvariable=self.vars["limitmb"],
-                                            width=8), "Maximum size of each EPUB. 0 = no limit, minimum 20.")
-        row("Title page", combo("titlepage", [l for _, l in CHOICES["titlepage"]]))
+                                            width=8), "limitmb")
+        row("Title page", combo("titlepage", [l for _, l in CHOICES["titlepage"]]), "titlepage")
         checks = ttk.Frame(box)
-        ttk.Checkbutton(checks, text="Grayscale", variable=self.vars["grayscale"]).pack(side="left")
-        ttk.Checkbutton(checks, text="Auto contrast", variable=self.vars["autocontrast"]).pack(side="left", padx=(12, 0))
-        ttk.Checkbutton(checks, text="Crop", variable=self.vars["crop"],
-                        command=self._on_crop_change).pack(side="left", padx=(12, 0))
-        checks.grid(row=rows[0], column=0, columnspan=2, sticky="w", pady=(6, 0))
+        for i, (text, key, cmd) in enumerate((("Grayscale", "grayscale", None), ("Auto contrast", "autocontrast", None),
+                                              ("Crop", "crop", self._on_crop_change))):
+            ttk.Checkbutton(checks, text=text, variable=self.vars[key], command=cmd).pack(side="left",
+                                                                                         padx=(12 if i else 0, 0))
+            self._help_icon(checks, key).pack(side="left", padx=(3, 0))
+        checks.grid(row=rows[0], column=0, columnspan=3, sticky="w", pady=(6, 0))
         more = ttk.Frame(box)
-        more.grid(row=rows[0] + 1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        more.grid(row=rows[0] + 1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         ttk.Button(more, text="All settings…", command=self._show_settings).pack(side="left")
         self.btn_cmd = ttk.Button(more, text="Command", command=self._show_command)
         self.btn_cmd.pack(side="right")
@@ -781,7 +869,7 @@ class App(tk.Tk):
 
         box.rowconfigure(100, weight=1)  # pushes the buttons to the bottom
         acts = ttk.Frame(box)
-        acts.grid(row=101, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        acts.grid(row=101, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         acts.columnconfigure(0, weight=1)
         self.btn_go = ttk.Button(acts, text="Convert all", style="Accent.TButton",
                                  command=lambda: self._start(dry=False))
@@ -827,6 +915,19 @@ class App(tk.Tk):
         self.pv_info.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
         return card
 
+    def _on_option_change(self):
+        """Redoes the Converted preview once the options stop changing (typing, dragging a slider)."""
+        if self.pv_mode != "converted":
+            return
+        if self.pv_change_after:
+            self.after_cancel(self.pv_change_after)
+        self.pv_change_after = self.after(900, self._refresh_converted)
+
+    def _refresh_converted(self):
+        self.pv_change_after = None
+        if self.pv_mode == "converted":
+            self._load_preview()
+
     def _schedule_preview(self):
         """Reloads the preview once the current changes are done."""
         if self.pv_after:
@@ -834,9 +935,10 @@ class App(tk.Tk):
         self.pv_after = self.after_idle(self._load_preview)
 
     def destroy(self):
-        if self.pv_after:
-            self.after_cancel(self.pv_after)
-            self.pv_after = None
+        for name in ("pv_after", "pv_change_after"):
+            if getattr(self, name, None):
+                self.after_cancel(getattr(self, name))
+                setattr(self, name, None)
         super().destroy()
 
     def _style_mode_buttons(self):
@@ -896,18 +998,26 @@ class App(tk.Tk):
         if not preview.HAVE_PIL:
             return self.pv_info.configure(text="The preview needs Pillow (pip install pillow).")
         exe = self._exe()
+        self.pv_whole = False
         if self.pv_mode == "original":
             try:
                 pages = preview.source_pages(path, self._get_choice("sort"))
             except (OSError, ValueError) as e:  # unreadable folder or bad zip
                 return self.pv_info.configure(text=f"Can't read this comic: {e}")
             if pages is not None:
+                self.pv_whole = True
                 return self._start_thumbs(token, pages, "")
             # CBR/RAR and PDF: the converter extracts the pages, with no filter.
             args = ["-ignore-config", f"-input={path}", "-profile=HR", "-nofilter", "-grayscale=0",
                     "-titlepage=0", "-covercaption=0", "-format=jpeg", "-quality=85",
                     f"-sort={self._get_choice('sort')}"]
-            note = "Extracted by the converter: double pages appear split."
+            if exe and self._crops_supported(exe):
+                # A crop of the whole page for every page: no page is split, one image per page.
+                args.append(f"-pagecrops={self._crops_file({'*': [0, 0, 1, 1]})}")
+                self.pv_whole = True
+                note = "Extracted by the converter."
+            else:
+                note = "Extracted by the converter: double pages appear split."
         else:
             try:
                 errs = self._validate()
@@ -916,7 +1026,8 @@ class App(tk.Tk):
                 errs, args = ["A number field contains an invalid value"], []
             if errs:
                 return self.pv_info.configure(text="Can't preview: " + "; ".join(errs))
-            note = "Converted with the current settings. Click Converted again after changing them."
+            note = ("Pages as your e-reader shows them, with the current settings (◧ ◨: side of a split page). "
+                    "Updated when you change a setting.")
         if not exe:
             return self.pv_info.configure(text="go-comic-converter was not found: see Settings > Advanced.")
         epub = self.pv_cache.get((path, tuple(args)))
@@ -977,11 +1088,20 @@ class App(tk.Tk):
             self.pv_note = note
             self.pv_info.configure(text=f"{len(self.pv_pages)} pages - loading…  {note}")
             self._layout_thumbs()
+            if self.pending_viewer is not None:  # "Edit the crop" from the Converted view
+                sid, self.pending_viewer = self.pending_viewer, None
+                for i, page in enumerate(self.pv_pages):
+                    if page.source_id == sid:
+                        self._open_viewer(i)
+                        break
+            elif self.viewer and self.viewer.winfo_exists():
+                self._show_page(self.viewer.index)  # the pages changed under the viewer
         elif kind == "thumb":
             i, png = data
             if png:
                 self.pv_photos[i] = tk.PhotoImage(master=self, data=png)
                 self.pv_canvas.itemconfigure(f"img{i}", image=self.pv_photos[i])
+                self._draw_crop_mark(i)
         elif kind == "done":
             self.pv_info.configure(text=f"{len(self.pv_pages)} pages. Click a page to see it bigger.  {self.pv_note}")
 
@@ -994,9 +1114,11 @@ class App(tk.Tk):
         tw, th, gap, cap = self.THUMB_W, self.THUMB_H, 14, 18
         cols = max(1, (c.winfo_width() - gap) // (tw + gap))
         x_off = max(gap, (c.winfo_width() - cols * (tw + gap) + gap) // 2)
+        self.pv_tiles = {}
         for i, page in enumerate(self.pv_pages):
             r, col = divmod(i, cols)
             x, y = x_off + col * (tw + gap), gap + r * (th + cap + gap)
+            self.pv_tiles[i] = (x, y)
             tag = f"page{i}"
             c.create_rectangle(x - 1, y - 1, x + tw + 1, y + th + 1, fill=p["field"], outline=p["field_border"],
                                tags=(tag,))
@@ -1004,22 +1126,73 @@ class App(tk.Tk):
             c.create_text(x + tw / 2, y + th + 4, text=page.label if len(page.label) < 18 else f"{i + 1}",
                           anchor="n", fill=p["muted"], font=("Segoe UI", 8), tags=(tag,))
             c.tag_bind(tag, "<Button-1>", lambda e, n=i: self._open_viewer(n))
+            self._draw_crop_mark(i)
         rows = (len(self.pv_pages) + cols - 1) // cols
         c.configure(scrollregion=(0, 0, c.winfo_width(), gap + rows * (th + cap + gap)))
 
+    def _current_comic(self):
+        if self.pv_items and self.pv_combo.current() >= 0:
+            return self.tree.set(self.pv_items[self.pv_combo.current()], "input")
+        return None
+
+    def _draw_crop_mark(self, i):
+        """✂ on a page with a crop; on the original pages, the crop box too."""
+        c, p = self.pv_canvas, self.theme.p
+        c.delete(f"mark{i}")
+        path = self._current_comic()
+        if not path or i not in self.pv_tiles or i >= len(self.pv_pages):
+            return
+        rect = self._crops_of(path).get(self.pv_pages[i].source_id)
+        if not rect:
+            return
+        x, y = self.pv_tiles[i]
+        tags = (f"mark{i}", f"page{i}")
+        photo = self.pv_photos.get(i)
+        if self.pv_whole and photo:
+            pw, ph = photo.width(), photo.height()
+            ix, iy = x + (self.THUMB_W - pw) / 2, y + (self.THUMB_H - ph) / 2
+            c.create_rectangle(ix + rect[0] * pw, iy + rect[1] * ph, ix + rect[2] * pw, iy + rect[3] * ph,
+                               outline=p["select"], width=2, tags=tags)
+        c.create_text(x + self.THUMB_W - 3, y + 2, text="✂", anchor="ne", fill=p["select"],
+                      font=("Segoe UI Symbol", 12, "bold"), tags=tags)
+
     def _open_viewer(self, index):
-        """A window with one page, as big as the window; arrow keys for the next and previous."""
-        if not (self.viewer and self.viewer.winfo_exists()):
+        """A window with one page, as big as the window, where its crop box is drawn.
+        Arrow keys for the next and previous pages."""
+        v = self.viewer
+        if not (v and v.winfo_exists()):
             v = self.viewer = tk.Toplevel(self)
-            v.geometry("720x960")
+            v.geometry("780x1000")
+            v.minsize(560, 480)
             v.configure(background=self.theme.p["bg"])
+            bar = ttk.Frame(v, style="Backdrop.TFrame", padding=(10, 8, 10, 4))
+            bar.pack(fill="x")
+            ttk.Button(bar, text="◀", width=3, command=lambda: self._show_page(v.index - 1)).pack(side="left")
+            ttk.Button(bar, text="▶", width=3, command=lambda: self._show_page(v.index + 1)).pack(side="left",
+                                                                                              padx=(4, 14))
+            v.crop_tools = ttk.Frame(bar, style="Backdrop.TFrame")
+            ttk.Button(v.crop_tools, text="Left half", command=lambda: self._apply_viewer_crop([0, 0, 0.5, 1])).pack(
+                side="left")
+            ttk.Button(v.crop_tools, text="Right half", command=lambda: self._apply_viewer_crop([0.5, 0, 1, 1])).pack(
+                side="left", padx=4)
+            ttk.Button(v.crop_tools, text="Remove crop", command=lambda: self._apply_viewer_crop(None)).pack(
+                side="left", padx=(10, 0))
+            v.edit_btn = ttk.Button(bar, text="Edit the crop of this page", style="Accent.TButton",
+                                    command=self._edit_source_crop)
+            v.hint = ttk.Label(v, style="Backdrop.TLabel", padding=(12, 0, 12, 6), wraplength=740)
+            v.hint.pack(fill="x")
             v.canvas = tk.Canvas(v, highlightthickness=0, borderwidth=0, background=self.theme.p["bg"])
             v.canvas.pack(fill="both", expand=True)
             v.bind("<Left>", lambda e: self._show_page(v.index - 1))
             v.bind("<Right>", lambda e: self._show_page(v.index + 1))
+            v.bind("<Delete>", lambda e: v.editable and self._apply_viewer_crop(None))
             v.bind("<Escape>", lambda e: v.destroy())
             v.canvas.bind("<Configure>", lambda e: self._show_page(v.index))
-            v.index = index
+            v.canvas.bind("<ButtonPress-1>", self._crop_press)
+            v.canvas.bind("<B1-Motion>", self._crop_drag)
+            v.canvas.bind("<ButtonRelease-1>", self._crop_release)
+            v.canvas.bind("<Motion>", self._crop_hover)
+            v.index, v.rect, v.drag, v.editable, v.box = index, None, None, False, None
             set_title_bar_dark(v, self.theme.p["dark"])
         self.viewer.lift()
         self.viewer.focus_set()
@@ -1030,51 +1203,216 @@ class App(tk.Tk):
         if not self.pv_pages or not (v and v.winfo_exists()):
             return
         v.index = index = max(0, min(index, len(self.pv_pages) - 1))
-        page = self.pv_pages[index]
+        page, path = self.pv_pages[index], self._current_comic()
         v.title(f"{self.pv_var.get()} - {page.label} ({index + 1}/{len(self.pv_pages)})   ← →")
-        w, h = max(v.canvas.winfo_width(), 100), max(v.canvas.winfo_height(), 100)
-        v.canvas.delete("all")
+        # The crop box is drawn on the source page: the pages of the Original view.
+        v.editable = bool(path) and self.pv_whole and page.source_id is not None
+        v.rect = self._crops_of(path).get(page.source_id) if v.editable else None
+        v.drag = None
+        if v.editable:
+            v.edit_btn.pack_forget()
+            v.crop_tools.pack(side="left")
+            exe = self._exe()
+            note = "" if exe and self._crops_supported(exe) else (
+                "  The converter in use doesn't know page crops: they are kept, but ignored until you use the "
+                "converter bundled with the app.")
+            v.hint.configure(text="Drag on the page to draw the crop box: the page will be exactly this rectangle, "
+                                  "as one page, never split in two. Drag inside the box to move it, its edges to "
+                                  "resize it. Delete removes it." + note)
+        else:
+            v.crop_tools.pack_forget()
+            if page.source_id is not None and path:
+                v.edit_btn.pack(side="left")
+            v.hint.configure(text="This is the page as converted. Crops are drawn on the original page: "
+                                  "Edit the crop of this page." if page.source_id is not None else "")
+        c = v.canvas
+        w, h = max(c.winfo_width(), 100), max(c.winfo_height(), 100)
+        c.delete("all")
         try:
-            png, _ = preview.thumbnail(page.load(), w, h)
+            png, _ = preview.thumbnail(page.load(), w - 24, h - 24)
             v.photo = tk.PhotoImage(master=self, data=png)
-            v.canvas.create_image(w / 2, h / 2, image=v.photo)
+            pw, ph = v.photo.width(), v.photo.height()
+            v.box = ((w - pw) / 2, (h - ph) / 2, pw, ph)
+            c.create_image(w / 2, h / 2, image=v.photo)
         except Exception as e:
-            v.canvas.create_text(w / 2, h / 2, text=f"Can't show this page: {e}", fill=self.theme.p["text"])
+            v.box = None
+            c.create_text(w / 2, h / 2, text=f"Can't show this page: {e}", fill=self.theme.p["text"])
+        self._draw_viewer_crop()
+
+    def _draw_viewer_crop(self):
+        """The crop box on the page, the rest of the page shaded."""
+        v, p = self.viewer, self.theme.p
+        c = v.canvas
+        c.delete("crop")
+        if not v.box or not v.rect:
+            return
+        ox, oy, pw, ph = v.box
+        x0, y0, x1, y1 = ox + v.rect[0] * pw, oy + v.rect[1] * ph, ox + v.rect[2] * pw, oy + v.rect[3] * ph
+        for box in ((ox, oy, ox + pw, y0), (ox, y1, ox + pw, oy + ph), (ox, y0, x0, y1), (x1, y0, ox + pw, y1)):
+            if box[2] > box[0] and box[3] > box[1]:
+                c.create_rectangle(*box, fill="black", stipple="gray50", outline="", tags="crop")
+        c.create_rectangle(x0, y0, x1, y1, outline=p["select"], width=2, tags="crop")
+        for hx, hy in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+            c.create_rectangle(hx - 4, hy - 4, hx + 4, hy + 4, fill=p["select"], outline="white", tags="crop")
+
+    def _crop_frac(self, e):
+        ox, oy, pw, ph = self.viewer.box
+        return min(max((e.x - ox) / pw, 0.0), 1.0), min(max((e.y - oy) / ph, 0.0), 1.0)
+
+    def _crop_edges(self, e):
+        """The edges of the crop box under the mouse: a set of "l", "t", "r", "b"."""
+        v = self.viewer
+        if not v.rect or not v.box:
+            return set()
+        ox, oy, pw, ph = v.box
+        x0, y0, x1, y1 = ox + v.rect[0] * pw, oy + v.rect[1] * ph, ox + v.rect[2] * pw, oy + v.rect[3] * ph
+        near, edges = 7, set()
+        if y0 - near <= e.y <= y1 + near:
+            if abs(e.x - x0) <= near:
+                edges.add("l")
+            elif abs(e.x - x1) <= near:
+                edges.add("r")
+        if x0 - near <= e.x <= x1 + near:
+            if abs(e.y - y0) <= near:
+                edges.add("t")
+            elif abs(e.y - y1) <= near:
+                edges.add("b")
+        return edges
+
+    def _crop_hover(self, e):
+        v = self.viewer
+        if not v.editable or not v.box or v.drag:
+            return
+        edges = self._crop_edges(e)
+        cursors = {frozenset("l"): "sb_h_double_arrow", frozenset("r"): "sb_h_double_arrow",
+                   frozenset("t"): "sb_v_double_arrow", frozenset("b"): "sb_v_double_arrow",
+                   frozenset("lt"): "size_nw_se", frozenset("rb"): "size_nw_se",
+                   frozenset("rt"): "size_ne_sw", frozenset("lb"): "size_ne_sw"}
+        fx, fy = self._crop_frac(e)
+        inside = v.rect and v.rect[0] < fx < v.rect[2] and v.rect[1] < fy < v.rect[3]
+        v.canvas.configure(cursor=cursors.get(frozenset(edges)) or ("fleur" if inside else "crosshair"))
+
+    def _crop_press(self, e):
+        v = self.viewer
+        if not v.editable or not v.box:
+            return
+        fx, fy = self._crop_frac(e)
+        edges = self._crop_edges(e)
+        if edges:
+            v.drag = ("resize", edges, list(v.rect))
+        elif v.rect and v.rect[0] < fx < v.rect[2] and v.rect[1] < fy < v.rect[3]:
+            v.drag = ("move", (fx, fy), list(v.rect))
+        else:
+            v.drag = ("new", (fx, fy), v.rect)
+
+    def _crop_drag(self, e):
+        v = self.viewer
+        if not v.drag:
+            return
+        fx, fy = self._crop_frac(e)
+        mode, data, start = v.drag
+        if mode == "new":
+            sx, sy = data
+            v.rect = [min(sx, fx), min(sy, fy), max(sx, fx), max(sy, fy)]
+        elif mode == "move":
+            dx, dy = fx - data[0], fy - data[1]
+            w, h = start[2] - start[0], start[3] - start[1]
+            x0, y0 = min(max(start[0] + dx, 0.0), 1.0 - w), min(max(start[1] + dy, 0.0), 1.0 - h)
+            v.rect = [x0, y0, x0 + w, y0 + h]
+        else:
+            r = list(start)
+            if "l" in data:
+                r[0] = min(fx, r[2] - 0.02)
+            if "r" in data:
+                r[2] = max(fx, r[0] + 0.02)
+            if "t" in data:
+                r[1] = min(fy, r[3] - 0.02)
+            if "b" in data:
+                r[3] = max(fy, r[1] + 0.02)
+            v.rect = r
+        self._draw_viewer_crop()
+
+    def _crop_release(self, e):
+        v = self.viewer
+        if not v.drag:
+            return
+        mode, _, start = v.drag
+        v.drag = None
+        if v.rect and v.rect[2] - v.rect[0] >= 0.02 and v.rect[3] - v.rect[1] >= 0.02:
+            self._apply_viewer_crop(v.rect)
+        else:  # a click without dragging: keeps the crop there was
+            v.rect = start if mode == "new" else v.rect
+            self._draw_viewer_crop()
+
+    def _apply_viewer_crop(self, rect):
+        """Saves the crop drawn in the viewer (None removes it)."""
+        v, path = self.viewer, self._current_comic()
+        if not (v and v.editable and path):
+            return
+        page = self.pv_pages[v.index]
+        self._set_crop(path, page.source_id, rect)
+        v.rect = self._crops_of(path).get(page.source_id)
+        self._draw_viewer_crop()
+        what = "removed" if rect is None else "saved: used by Convert and the Converted preview"
+        v.hint.configure(text=f"Crop of {page.label} {what}.  Drag to draw another, Delete removes it.")
+
+    def _edit_source_crop(self):
+        """From a converted page, opens its source page in the Original view, to draw its crop."""
+        v = self.viewer
+        if not (v and v.winfo_exists()) or not self.pv_pages:
+            return
+        self.pending_viewer = self.pv_pages[v.index].source_id
+        self._set_preview_mode("original")
 
     # ---------- widget helpers ----------
 
     def _tab(self, nb):
         f = ttk.Frame(nb, padding=12)
-        f.columnconfigure(1, weight=1)
-        f.columnconfigure(4, weight=1)
+        # label | widget | ? | gap, for the left and the right column
+        f.columnconfigure(3, weight=1)
+        f.columnconfigure(7, weight=1)
         f._row = [0, 0]  # next free row for the left and right columns
         return f
 
-    def _place(self, tab, side, label, widget, tip=None, label_widget=True):
+    def _help_icon(self, parent, key=None, text=None):
+        """A round ? that explains an option: on hover, and on click."""
+        title, body = HELP.get(key, (None, text)) if key else (None, text)
+        p, s = self.theme.p, 18
+        c = tk.Canvas(parent, width=s, height=s, highlightthickness=0, borderwidth=0, background=p["card"],
+                      cursor="question_arrow")
+        c.create_oval(1, 1, s - 2, s - 2, fill=p["select"], outline=p["accent_border"], tags="dot")
+        c.create_text(s / 2 - 0.5, s / 2 - 0.5, text="?", fill="white", font=("Segoe UI", 8, "bold"))
+        tip = Tooltip(c, f"{title}\n{body}" if title else body)
+        c.bind("<Button-1>", lambda e: tip.hide(e) if tip.tip else tip.show(e))
+        self.help_icons.append(c)
+        return c
+
+    def _place(self, tab, side, label, widget, tip=None, label_widget=True, key=None):
         row = tab._row[side]
-        col = side * 3
+        col = side * 4
+        tip = HELP[key][1] if key in HELP else tip
         if label_widget:
             lbl = ttk.Label(tab, text=label)
             lbl.grid(row=row, column=col, sticky="w", pady=3, padx=(0, 8))
             if tip:
                 Tooltip(lbl, tip)
         widget.grid(row=row, column=col + 1, sticky="w", pady=3)
-        if tip:
-            Tooltip(widget, tip)
+        if key in HELP or tip:
+            self._help_icon(tab, key, tip).grid(row=row, column=col + 2, sticky="w", padx=(6, 0))
         if side == 0:
-            ttk.Frame(tab, width=24).grid(row=row, column=2)
+            ttk.Frame(tab, width=24).grid(row=row, column=3)
         tab._row[side] += 1
         return widget
 
     def _check(self, tab, side, key, label, tip=None, command=None):
         v = self.vars[key] = tk.BooleanVar(value=DEFAULTS.get(key, False))
         cb = ttk.Checkbutton(tab, text=label, variable=v, command=command)
-        return self._place(tab, side, label, cb, tip, label_widget=False)
+        return self._place(tab, side, label, cb, tip, label_widget=False, key=key)
 
     def _spin(self, tab, side, key, label, lo, hi, inc=1, tip=None, is_float=False):
         v = self.vars[key] = (tk.DoubleVar if is_float else tk.IntVar)(value=DEFAULTS[key])
         sp = ttk.Spinbox(tab, from_=lo, to=hi, increment=inc, textvariable=v, width=8)
-        return self._place(tab, side, label, sp, tip)
+        return self._place(tab, side, label, sp, tip, key=key)
 
     def _scale(self, tab, side, key, label, lo, hi, tip=None):
         v = self.vars[key] = tk.IntVar(value=DEFAULTS[key])
@@ -1082,7 +1420,7 @@ class App(tk.Tk):
         ttk.Scale(f, from_=lo, to=hi, variable=v, length=180,
                   command=lambda x: v.set(round(float(x)))).pack(side="left")
         ttk.Spinbox(f, from_=lo, to=hi, textvariable=v, width=5).pack(side="left", padx=(6, 0))
-        return self._place(tab, side, label, f, tip)
+        return self._place(tab, side, label, f, tip, key=key)
 
     def _choice(self, tab, side, key, label, tip=None, command=None, width=30):
         options = CHOICES[key]
@@ -1093,7 +1431,7 @@ class App(tk.Tk):
         self._set_choice(key, DEFAULTS.get(key, GUI_DEFAULTS.get(key)))
         if command:
             cb.bind("<<ComboboxSelected>>", lambda e: command())
-        return self._place(tab, side, label, cb, tip)
+        return self._place(tab, side, label, cb, tip, key=key)
 
     def _set_choice(self, key, value):
         for val, lbl in CHOICES[key]:
@@ -1128,7 +1466,7 @@ class App(tk.Tk):
         v.trace_add("write", refresh)
         refresh()
         ttk.Button(f, text="Pick…", command=pick, width=7).pack(side="left")
-        return self._place(tab, side, label, f, tip)
+        return self._place(tab, side, label, f, tip, key=key)
 
     def _entry(self, tab, side, key, label, tip=None, width=34, browse=None):
         default = DEFAULTS.get(key, GUI_DEFAULTS.get(key, ""))
@@ -1137,7 +1475,7 @@ class App(tk.Tk):
         ttk.Entry(f, textvariable=v, width=width).pack(side="left")
         if browse:
             ttk.Button(f, text="…", width=3, command=browse).pack(side="left", padx=(4, 0))
-        return self._place(tab, side, label, f, tip)
+        return self._place(tab, side, label, f, tip, key=key)
 
     # ---------- tabs ----------
 
@@ -1148,7 +1486,7 @@ class App(tk.Tk):
                                        textvariable=self.vars["profile"], height=20)
         self.comboboxes.append(self.profile_cb)
         self.profile_cb.bind("<<ComboboxSelected>>", lambda e: self._on_profile_change())
-        self._place(t, 0, "Device profile:", self.profile_cb, "The e-reader you will read the comic on.")
+        self._place(t, 0, "Device profile:", self.profile_cb, key="profile")
         self.profile_info = ttk.Label(t, style="Muted.TLabel")
         self._place(t, 0, "Features:", self.profile_info)
         self._choice(t, 0, "mode", "Reading mode:", "Manga reads right to left. Webtoon joins the images of each "
@@ -1173,9 +1511,7 @@ class App(tk.Tk):
         for txt, fn in [("Good", "good"), ("Great", "great"), ("Best", "best"), ("Max", "max"), ("No filter", "nofilter")]:
             ttk.Button(presets, text=txt, width=9, command=lambda p=fn: self._apply_preset(p)).pack(side="left", padx=(0, 4))
         t._row[0] = max(t._row) + 1
-        self._place(t, 0, "Quality presets:", presets,
-                    "Good: grayscale JPEG q90 · Great: + no resize · Best: color JPEG q100, no resize · "
-                    "Max: color PNG, no resize · No filter: turn off all filters")
+        self._place(t, 0, "Quality presets:", presets, key="presets")
         return t
 
     def _tab_image(self, nb):
@@ -1306,10 +1642,11 @@ class App(tk.Tk):
         for p in sorted(paths, key=natural_key):
             p = os.path.normpath(p)
             if p not in existing:
-                self.tree.insert("", "end", values=(p, "Pending", ""))
+                self.tree.insert("", "end", values=(p, "", "Pending", ""))
                 existing.add(p)
         self._restripe()
         self._update_view()
+        self._refresh_crop_marks()
 
     def _restripe(self):
         """Alternate the colors of the rows of the queue."""
@@ -1448,6 +1785,11 @@ class App(tk.Tk):
         if extra:
             import shlex
             args.extend(shlex.split(extra, posix=False))
+        crops = self._crops_of(item)
+        if crops:
+            exe = self._exe()
+            if exe and self._crops_supported(exe):
+                args.append(f"-pagecrops={self._crops_file({str(k): v for k, v in crops.items()})}")
         if dry:
             args.append("-dry")
         if json_out:
@@ -1491,6 +1833,68 @@ class App(tk.Tk):
         self.status.set("Command copied to the clipboard")
 
     # ---------- running ----------
+
+    # ---------- page crops ----------
+
+    @staticmethod
+    def _comic_key(path):
+        return os.path.normcase(os.path.abspath(path))
+
+    def _load_crops(self):
+        try:
+            data = json.loads(CROPS_FILE.read_text(encoding="utf-8"))
+            return {k: {int(i): [float(x) for x in r] for i, r in v.items()} for k, v in data.items()}
+        except (OSError, ValueError, TypeError, AttributeError):
+            return {}
+
+    def _save_crops(self):
+        data = {k: {str(i): r for i, r in sorted(v.items())} for k, v in self.page_crops.items() if v}
+        try:
+            CROPS_FILE.write_text(json.dumps(data, indent=1), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _crops_of(self, path):
+        return self.page_crops.get(self._comic_key(path), {})
+
+    def _set_crop(self, path, page, rect):
+        """Saves the crop of a page of a comic, or removes it (rect None)."""
+        crops = self.page_crops.setdefault(self._comic_key(path), {})
+        if rect:
+            crops[page] = [round(min(max(v, 0.0), 1.0), 5) for v in rect]
+        else:
+            crops.pop(page, None)
+        self._save_crops()
+        self._refresh_crop_marks()
+        self._on_option_change()
+
+    def _crops_supported(self, exe):
+        """Tells if the converter knows -pagecrops: the bundled one does, a stock one doesn't."""
+        if exe not in self.crop_support:
+            try:
+                out = subprocess.run([exe, "-help", "-ignore-config"], capture_output=True, text=True,
+                                     stdin=subprocess.DEVNULL, timeout=20, **popen_kwargs())
+                self.crop_support[exe] = "-pagecrops" in out.stdout + out.stderr
+            except (OSError, subprocess.TimeoutExpired):
+                self.crop_support[exe] = False
+        return self.crop_support[exe]
+
+    def _crops_file(self, crops):
+        """The crops in a JSON file named after its content: another crop gives another command line."""
+        text = json.dumps(crops, sort_keys=True)
+        path = os.path.join(self.pv_tmp, f"crops-{hashlib.sha1(text.encode()).hexdigest()[:12]}.json")
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        return path
+
+    def _refresh_crop_marks(self):
+        """The number of cropped pages in the queue, and the marks on the thumbnails."""
+        for i in self.tree.get_children():
+            n = len(self._crops_of(self.tree.set(i, "input")))
+            self.tree.set(i, "crops", f"✂ {n}" if n else "")
+        for i in range(len(self.pv_pages)):
+            self._draw_crop_mark(i)
 
     def _exe(self):
         exe = find_exe(self.vars["exe"].get().strip())
@@ -1752,11 +2156,13 @@ class App(tk.Tk):
         if isinstance(data, dict) and data.get("settings_version", 1) < 2 and data.get("sort") == 1:
             # Saved before the GUI had its own default: the files were sorted as text.
             data["sort"] = PREFERRED["sort"]
+        self.tutorial_seen = bool(data.get("tutorial_seen")) if isinstance(data, dict) else False
         self._apply_settings({**DEFAULTS, **PREFERRED, **GUI_DEFAULTS, **data})
 
     def _save_settings(self):
         try:
-            data = {**self._collect_settings(), "settings_version": SETTINGS_VERSION}
+            data = {**self._collect_settings(), "settings_version": SETTINGS_VERSION,
+                    "tutorial_seen": self.tutorial_seen}
             SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except OSError:
             pass
