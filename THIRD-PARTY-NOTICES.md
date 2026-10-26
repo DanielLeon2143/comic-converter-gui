@@ -8,6 +8,7 @@
 | [MuPDF](https://mupdf.com) 1.28.0, through [go-fitz](https://github.com/gen2brain/go-fitz) v1.28.2 | GNU AGPL-3.0, Copyright Artifex Software | [mupdf-1.28.0-source.tar.gz](https://mupdf.com/downloads/archive/mupdf-1.28.0-source.tar.gz), [go-fitz v1.28.2](https://github.com/gen2brain/go-fitz/tree/v1.28.2) |
 | [Literata](https://github.com/googlefonts/literata) font, embedded by go-comic-converter | SIL Open Font License 1.1 | `go-comic-converter/internal/pkg/fonts/OFL.txt` |
 | The Go modules of go-comic-converter | see each module (BSD, MIT, Apache-2.0) | `go-comic-converter/go.mod` |
+| [Pillow](https://python-pillow.org) 12, for the page preview, with the image libraries it bundles (libjpeg-turbo, libwebp, libtiff, zlib, FreeType...) | MIT-CMU (Pillow), and BSD / IJG / FreeType style licenses for the libraries: see [Pillow's license](https://github.com/python-pillow/Pillow/blob/main/LICENSE) | pypi.org/project/pillow |
 | [Python](https://www.python.org) 3.14 and Tcl/Tk 9.0, packed by [PyInstaller](https://pyinstaller.org) | PSF License, Tcl/Tk license (BSD style), PyInstaller bootloader: GPL-2.0 with an exception allowing this use | python.org, tcl.tk |
 
 Because MuPDF is licensed under the AGPL-3.0, this repository (the GUI and the build script) is
