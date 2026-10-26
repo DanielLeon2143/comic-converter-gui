@@ -7,6 +7,7 @@ over a queue of comics, and follows its progress through its -json output.
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -155,6 +156,19 @@ GUI_DEFAULTS = {
     "open_folder_when_done": False,
     "theme": "system",
 }
+
+# Starting values of the GUI that differ from the defaults of the tool, so they are passed as flags.
+# The tool sorts the file names as text by default (page1, page10, page2): sort the numbers by value.
+PREFERRED = {"sort": 2}
+
+# Version of the settings file. 2: "sort" defaults to 2 (version 1 files have the tool's default, 1).
+SETTINGS_VERSION = 2
+
+
+def natural_key(path):
+    """Sort key putting "Vol 2" before "Vol 10": the numbers are compared by value."""
+    return [(0, int(part), "") if part.isdigit() else (1, 0, part.lower())
+            for part in re.split(r"(\d+)", os.path.basename(os.path.normpath(path))) if part]
 
 
 def bundled_exe():
@@ -745,7 +759,7 @@ class App(tk.Tk):
 
     def _add_inputs(self, paths):
         existing = {self.tree.set(i, "input") for i in self.tree.get_children()}
-        for p in paths:
+        for p in sorted(paths, key=natural_key):
             p = os.path.normpath(p)
             if p not in existing:
                 self.tree.insert("", "end", values=(p, "Pending"))
@@ -766,7 +780,7 @@ class App(tk.Tk):
             self._add_folder_path(d)
 
     def _add_folder_path(self, d):
-        archives = [e for e in sorted(Path(d).iterdir()) if e.is_file() and e.suffix.lower() in ARCHIVE_EXTS]
+        archives = [e for e in Path(d).iterdir() if e.is_file() and e.suffix.lower() in ARCHIVE_EXTS]
         if archives and messagebox.askyesno(
                 APP_NAME, f"{Path(d).name} contains {len(archives)} comic archive(s).\n\n"
                           "Yes: add each archive separately\nNo: convert the folder itself as one comic"):
@@ -779,7 +793,7 @@ class App(tk.Tk):
             self._log("Wait for the conversion to finish before adding comics.\n", "err")
             return
         skipped = []
-        for p in paths:
+        for p in sorted(paths, key=natural_key):
             if os.path.isdir(p):
                 self._add_folder_path(p)
             elif Path(p).suffix.lower() in ARCHIVE_EXTS:
@@ -1146,18 +1160,22 @@ class App(tk.Tk):
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             data = {}
-        self._apply_settings({**DEFAULTS, **GUI_DEFAULTS, **data})
+        if isinstance(data, dict) and data.get("settings_version", 1) < 2 and data.get("sort") == 1:
+            # Saved before the GUI had its own default: the files were sorted as text.
+            data["sort"] = PREFERRED["sort"]
+        self._apply_settings({**DEFAULTS, **PREFERRED, **GUI_DEFAULTS, **data})
 
     def _save_settings(self):
         try:
-            SETTINGS_FILE.write_text(json.dumps(self._collect_settings(), indent=2), encoding="utf-8")
+            data = {**self._collect_settings(), "settings_version": SETTINGS_VERSION}
+            SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except OSError:
             pass
 
     def _reset_options(self):
         if messagebox.askyesno(APP_NAME, "Reset every option to the go-comic-converter defaults?"):
             keep = {k: self._value(k) for k in ("exe", "output_dir", "theme")}
-            self._apply_settings({**DEFAULTS, **GUI_DEFAULTS, **keep})
+            self._apply_settings({**DEFAULTS, **PREFERRED, **GUI_DEFAULTS, **keep})
 
     def _on_close(self):
         if self.worker and not messagebox.askyesno(APP_NAME, "A conversion is running. Stop it and quit?"):
