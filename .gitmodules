@@ -1,0 +1,3 @@
+[submodule "go-comic-converter"]
+	path = go-comic-converter
+	url = https://github.com/celogeek/go-comic-converter.git
