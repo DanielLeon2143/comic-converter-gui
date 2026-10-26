@@ -255,6 +255,112 @@ class FileDrop:
         shell32.DragAcceptFiles(hwnd, True)
 
 
+def ask_folders(parent, title, initial_dir=None):
+    """Folder picker in which several folders can be selected. Returns their paths, [] if cancelled.
+
+    Tk's askdirectory can't select several folders: on Windows the folder dialog is opened directly
+    (IFileOpenDialog), anywhere else or if that fails it falls back to askdirectory (one folder).
+    """
+    if os.name == "nt":
+        try:
+            return _ask_folders_windows(parent, title, initial_dir)
+        except (AttributeError, OSError):
+            pass
+    d = filedialog.askdirectory(parent=parent, title=title, initialdir=initial_dir or None)
+    return [d] if d else []
+
+
+def _ask_folders_windows(parent, title, initial_dir):
+    import ctypes
+    from ctypes import wintypes
+
+    ole32, shell32, user32 = ctypes.windll.ole32, ctypes.windll.shell32, ctypes.windll.user32
+    HRESULT, PVOID = ctypes.c_long, ctypes.c_void_p
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("d1", ctypes.c_ulong), ("d2", ctypes.c_ushort), ("d3", ctypes.c_ushort),
+                    ("d4", ctypes.c_ubyte * 8)]
+
+    def guid(text):
+        g = GUID()
+        ole32.CLSIDFromString(ctypes.c_wchar_p(text), ctypes.byref(g))
+        return g
+
+    def method(obj, index, *argtypes):
+        """Method number index of the vtable of the COM object obj."""
+        vtable = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(PVOID)))[0]
+        fn = ctypes.WINFUNCTYPE(HRESULT, PVOID, *argtypes)(vtable[index])
+        return lambda *args: fn(obj, *args)
+
+    def check(hr):
+        if hr < 0:
+            raise OSError(f"COM error 0x{hr & 0xFFFFFFFF:08X}")
+
+    def release(obj):
+        if obj.value:
+            method(obj, 2)()
+
+    CLSID_FileOpenDialog = guid("{DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}")
+    IID_IFileOpenDialog = guid("{D57C7288-D4AD-4768-BE02-9D969532D960}")
+    IID_IShellItem = guid("{43826D1E-E718-42EE-BC55-A1E261C37BFE}")
+    FOS_PICKFOLDERS, FOS_FORCEFILESYSTEM, FOS_ALLOWMULTISELECT = 0x20, 0x40, 0x200
+    SIGDN_FILESYSPATH = 0x80058000
+    ERROR_CANCELLED = 0x800704C7 - (1 << 32)
+
+    ole32.CoInitializeEx.argtypes = [PVOID, ctypes.c_uint]
+    ole32.CoCreateInstance.argtypes = [ctypes.POINTER(GUID), PVOID, ctypes.c_uint, ctypes.POINTER(GUID),
+                                       ctypes.POINTER(PVOID)]
+    ole32.CoTaskMemFree.argtypes = [PVOID]
+    shell32.SHCreateItemFromParsingName.argtypes = [ctypes.c_wchar_p, PVOID, ctypes.POINTER(GUID),
+                                                    ctypes.POINTER(PVOID)]
+    user32.GetParent.argtypes = [wintypes.HWND]
+    user32.GetParent.restype = wintypes.HWND
+
+    # Tk has usually initialized COM already: S_FALSE, or RPC_E_CHANGED_MODE, are fine.
+    initialized = ole32.CoInitializeEx(None, 0x2) >= 0  # COINIT_APARTMENTTHREADED
+    dialog, results = PVOID(), PVOID()
+    try:
+        check(ole32.CoCreateInstance(ctypes.byref(CLSID_FileOpenDialog), None, 1,  # CLSCTX_INPROC_SERVER
+                                     ctypes.byref(IID_IFileOpenDialog), ctypes.byref(dialog)))
+        options = ctypes.c_uint()
+        check(method(dialog, 10, ctypes.POINTER(ctypes.c_uint))(ctypes.byref(options)))  # GetOptions
+        check(method(dialog, 9, ctypes.c_uint)(
+            options.value | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_ALLOWMULTISELECT))  # SetOptions
+        method(dialog, 17, ctypes.c_wchar_p)(title)  # SetTitle
+        if initial_dir and os.path.isdir(initial_dir):
+            folder = PVOID()
+            # The shell only parses backslashes.
+            if shell32.SHCreateItemFromParsingName(os.path.normpath(initial_dir), None, ctypes.byref(IID_IShellItem),
+                                                   ctypes.byref(folder)) >= 0:
+                method(dialog, 12, PVOID)(folder)  # SetFolder
+                release(folder)
+        owner = user32.GetParent(parent.winfo_id()) or parent.winfo_id()
+        hr = method(dialog, 3, wintypes.HWND)(owner)  # Show: modal to the window
+        if hr == ERROR_CANCELLED:
+            return []
+        check(hr)
+        check(method(dialog, 27, ctypes.POINTER(PVOID))(ctypes.byref(results)))  # GetResults
+        count = ctypes.c_uint()
+        check(method(results, 7, ctypes.POINTER(ctypes.c_uint))(ctypes.byref(count)))  # GetCount
+        paths = []
+        for i in range(count.value):
+            item, name = PVOID(), PVOID()
+            check(method(results, 8, ctypes.c_uint, ctypes.POINTER(PVOID))(i, ctypes.byref(item)))  # GetItemAt
+            try:
+                check(method(item, 5, ctypes.c_uint, ctypes.POINTER(PVOID))(  # GetDisplayName
+                    SIGDN_FILESYSPATH, ctypes.byref(name)))
+                paths.append(ctypes.wstring_at(name.value))
+                ole32.CoTaskMemFree(name)
+            finally:
+                release(item)
+        return paths
+    finally:
+        release(results)
+        release(dialog)
+        if initialized:
+            ole32.CoUninitialize()
+
+
 class Tooltip:
     def __init__(self, widget, text):
         self.widget, self.text, self.tip = widget, text, None
@@ -293,6 +399,7 @@ class App(tk.Tk):
         self.proc = None
         self.stop_requested = False
         self.comboboxes = []
+        self.last_dir = None  # where the folder dialog opens next
         self.theme = Theme(self)
         self.theme.apply(self._saved_theme_is_dark())  # draws the images the widgets are built with
 
@@ -445,7 +552,7 @@ class App(tk.Tk):
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.bind("<Delete>", lambda e: self._remove_selected())
 
-        btns = [("Add files…", self._add_files), ("Add folder…", self._add_folder),
+        btns = [("Add files…", self._add_files), ("Add folders…", self._add_folder),
                 ("Remove", self._remove_selected), ("Clear", self._clear_queue)]
         for i, (txt, cmd) in enumerate(btns):
             ttk.Button(box, text=txt, command=cmd, width=14).grid(row=i, column=2, padx=(10, 0), pady=2, sticky="ew")
@@ -775,31 +882,44 @@ class App(tk.Tk):
         self._add_inputs(filedialog.askopenfilenames(parent=self, title="Add comics", filetypes=INPUT_TYPES))
 
     def _add_folder(self):
-        d = filedialog.askdirectory(parent=self, title="Add a folder of images")
-        if d:
-            self._add_folder_path(d)
+        dirs = ask_folders(self, "Add folders (Ctrl or Shift + click to select several)", self.last_dir)
+        if dirs:
+            self.last_dir = os.path.dirname(os.path.normpath(dirs[0]))
+            self._add_folders(dirs)
 
-    def _add_folder_path(self, d):
-        archives = [e for e in Path(d).iterdir() if e.is_file() and e.suffix.lower() in ARCHIVE_EXTS]
-        if archives and messagebox.askyesno(
-                APP_NAME, f"{Path(d).name} contains {len(archives)} comic archive(s).\n\n"
-                          "Yes: add each archive separately\nNo: convert the folder itself as one comic"):
-            self._add_inputs(map(str, archives))
-            return
-        self._add_inputs([d])
+    def _add_folders(self, dirs):
+        """Queues folders: each one as a comic, or the comic archives they contain (asked once for all)."""
+        archives = {}
+        for d in dirs:
+            found = [str(e) for e in Path(d).iterdir() if e.is_file() and e.suffix.lower() in ARCHIVE_EXTS]
+            if found:
+                archives[d] = found
+        if archives:
+            n = sum(map(len, archives.values()))
+            where = (f"{Path(next(iter(archives))).name} contains" if len(archives) == 1
+                     else f"{len(archives)} of the folders contain")
+            if messagebox.askyesno(APP_NAME, f"{where} {n} comic archive(s).\n\n"
+                                             "Yes: add each archive separately\n"
+                                             "No: convert each folder as one comic"):
+                self._add_inputs([d for d in dirs if d not in archives] + [a for f in archives.values() for a in f])
+                return
+        self._add_inputs(dirs)
 
     def _on_drop(self, paths):
         if self.worker:
             self._log("Wait for the conversion to finish before adding comics.\n", "err")
             return
-        skipped = []
-        for p in sorted(paths, key=natural_key):
+        skipped, dirs, files = [], [], []
+        for p in paths:
             if os.path.isdir(p):
-                self._add_folder_path(p)
+                dirs.append(p)
             elif Path(p).suffix.lower() in ARCHIVE_EXTS:
-                self._add_inputs([p])
+                files.append(p)
             else:
                 skipped.append(Path(p).name)
+        if dirs:
+            self._add_folders(dirs)
+        self._add_inputs(files)
         if skipped:
             self._log("Not a comic, skipped: " + ", ".join(skipped) + "\n", "err")
 
