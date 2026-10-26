@@ -11,11 +11,14 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
+import preview
 from theme import Theme, set_title_bar_dark, windows_dark_mode
 
 APP_NAME = "Comic Converter"
@@ -390,8 +393,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1020x880")
-        self.minsize(900, 760)
+        self.geometry("1240x900")
+        self.minsize(1040, 720)
 
         self.vars = {}
         self.events = queue.Queue()
@@ -399,6 +402,17 @@ class App(tk.Tk):
         self.proc = None
         self.stop_requested = False
         self.comboboxes = []
+        # Preview: a token per load, so the results of an older load are dropped.
+        self.pv_mode = "original"
+        self.pv_token = 0
+        self.pv_items = []    # queue items, in the order of the comic picker
+        self.pv_pages = []    # preview.Page of the comic shown
+        self.pv_photos = {}   # index -> PhotoImage of the thumbnail
+        self.pv_proc = None   # converter run for the preview
+        self.pv_cache = {}    # (input, arguments) -> EPUB written for the preview
+        self.pv_tmp = tempfile.mkdtemp(prefix="comic-converter-preview-")
+        self.pv_note = ""
+        self.viewer = None
         self.last_dir = None  # where the folder dialog opens next
         self.theme = Theme(self)
         self.theme.apply(self._saved_theme_is_dark())  # draws the images the widgets are built with
@@ -419,27 +433,126 @@ class App(tk.Tk):
     # ---------- layout ----------
 
     def _build(self):
+        """Header; a drop zone while the queue is empty, then the workspace: preview and export
+        options, the queue with the progress, the log. All the options are in the Settings window."""
         self._build_header()
+        self._build_settings_window()  # creates the variables of the options, used by the export panel
 
         root = ttk.Frame(self, padding=(12, 10, 12, 12), style="Backdrop.TFrame")
         root.pack(fill="both", expand=True)
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(1, weight=1)
+        root.rowconfigure(0, weight=1)
+        self.empty_view = self._build_drop_zone(root)
+        self.work_view = ttk.Frame(root, style="Backdrop.TFrame")
+        self.work_view.columnconfigure(0, weight=1)
+        self.work_view.rowconfigure(0, weight=1)
 
-        self._build_queue(root).grid(row=0, column=0, sticky="nsew")
+        paned = self.work_paned = ttk.PanedWindow(self.work_view, orient="vertical")
+        paned.grid(row=0, column=0, sticky="nsew")
+        self.sashes_placed = False
+        paned.bind("<Configure>", lambda e: self.sashes_placed or self.after_idle(self._place_sashes))
+        top = ttk.Frame(paned, style="Backdrop.TFrame")
+        top.columnconfigure(0, weight=1)
+        top.rowconfigure(0, weight=1)
+        self._build_preview(top).grid(row=0, column=0, sticky="nsew")
+        self._build_export(top).grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        paned.add(top, weight=5)
+        paned.add(self._build_queue(paned), weight=3)
+        paned.add(self._build_log(paned), weight=1)
 
-        paned = ttk.PanedWindow(root, orient="vertical")
-        paned.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
-        nb = self.notebook = ttk.Notebook(paned)
+        # The preview follows the sort of the files.
+        self.pv_after = None
+        self.vars["sort"].trace_add("write", lambda *_: self._schedule_preview() if self.pv_mode == "original" else None)
+        self._update_view()
+
+    def _build_settings_window(self):
+        """All the options, in tabs, in a window of their own opened from the header."""
+        w = self.settings_win = tk.Toplevel(self)
+        w.withdraw()
+        w.title(f"{APP_NAME} - Settings")
+        w.geometry("940x560")
+        w.minsize(800, 460)
+        w.transient(self)
+        w.protocol("WM_DELETE_WINDOW", w.withdraw)
+        frame = ttk.Frame(w, padding=12, style="Backdrop.TFrame")
+        frame.pack(fill="both", expand=True)
+        nb = self.notebook = ttk.Notebook(frame)
+        nb.pack(fill="both", expand=True)
         nb.add(self._tab_general(nb), text="General")
         nb.add(self._tab_image(nb), text="Image")
         nb.add(self._tab_crop(nb), text="Crop")
         nb.add(self._tab_pages(nb), text="Pages & Layout")
         nb.add(self._tab_advanced(nb), text="Advanced")
-        paned.add(nb, weight=3)
-        paned.add(self._build_log(paned), weight=2)
+        bar = ttk.Frame(frame, style="Backdrop.TFrame")
+        bar.pack(fill="x", pady=(10, 0))
+        ttk.Label(bar, text="Changes apply right away, and are remembered.",
+                  style="Backdrop.TLabel").pack(side="left")
+        ttk.Button(bar, text="Done", style="Accent.TButton", command=w.withdraw).pack(side="right", ipadx=10)
 
-        self._build_actions(root).grid(row=2, column=0, sticky="ew", pady=(10, 0))
+    def _show_settings(self):
+        w = self.settings_win
+        w.deiconify()
+        w.lift()
+        w.focus_set()
+        set_title_bar_dark(w, self.theme.p["dark"])
+
+    def _build_drop_zone(self, parent):
+        card, body = self._card(parent)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        c = self.drop_canvas = tk.Canvas(body, highlightthickness=0, borderwidth=0)
+        c.grid(row=0, column=0, sticky="nsew")
+        self.drop_buttons = ttk.Frame(c)
+        ttk.Button(self.drop_buttons, text="Select Folder", style="Accent.TButton",
+                   command=self._add_folder).pack(side="left", ipadx=12, ipady=4)
+        ttk.Button(self.drop_buttons, text="Select File", command=self._add_files).pack(side="left", padx=(10, 0),
+                                                                                       ipadx=12, ipady=4)
+        c.bind("<Configure>", lambda e: self._draw_drop_zone())
+        return card
+
+    def _draw_drop_zone(self):
+        c, p = self.drop_canvas, self.theme.p
+        w, h = c.winfo_width(), c.winfo_height()
+        c.delete("all")
+        c.configure(background=p["card"])
+        m, r = 14, 18
+        x0, y0, x1, y1 = m, m, w - m, h - m
+        if x1 - x0 < 2 * r or y1 - y0 < 2 * r:
+            return
+        # Rounded dashed frame.
+        pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,
+               x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+        # Filled with the card color: the corners of the buttons show it.
+        c.create_polygon(pts, smooth=True, fill=p["card"], outline=p["muted"], dash=(8, 6), width=2)
+        cx, cy = w / 2, h / 2
+        # Arrow into a tray.
+        c.create_polygon(cx - 7, cy - 104, cx + 7, cy - 104, cx + 7, cy - 78, cx + 18, cy - 78, cx, cy - 58,
+                         cx - 18, cy - 78, cx - 7, cy - 78, fill=p["muted"], outline="")
+        c.create_line(cx - 30, cy - 62, cx - 30, cy - 48, cx + 30, cy - 48, cx + 30, cy - 62, fill=p["muted"],
+                      width=4, joinstyle="round", capstyle="round")
+        c.create_text(cx, cy - 22, text="Drop comics or folders here", font=("Segoe UI Semibold", 16), fill=p["text"])
+        c.create_text(cx, cy + 8, text="Folders of images, CBZ, ZIP, CBR, RAR or PDF files - as many as you like",
+                      font=("Segoe UI", 10), fill=p["muted"])
+        c.create_window(cx, cy + 58, window=self.drop_buttons)
+
+    def _place_sashes(self):
+        """First split of the workspace: preview and options, queue, log. Done on the first resize
+        of the pane, once it has its real height."""
+        h = self.work_paned.winfo_height()
+        if h > 300 and not self.sashes_placed:
+            self.work_paned.sashpos(0, int(h * 0.58))
+            self.work_paned.sashpos(1, int(h * 0.87))
+            self.sashes_placed = True
+
+    def _update_view(self):
+        """The drop zone while the queue is empty, the workspace after."""
+        if self.tree.get_children():
+            self.empty_view.grid_remove()
+            self.work_view.grid(row=0, column=0, sticky="nsew")
+        else:
+            self.work_view.grid_remove()
+            self.empty_view.grid(row=0, column=0, sticky="nsew")
+        self._refresh_picker()
 
     def _build_header(self):
         """Brushed metal bar with the embossed title and the dark mode switch."""
@@ -458,9 +571,13 @@ class App(tk.Tk):
         c.create_text(0, y, text="☀", font=("Segoe UI Symbol", 13), anchor="e", tags=("right", "sun"))
         c.create_image(0, y, image=self.theme.photos["switch_off"], anchor="e", tags=("right", "switch"))
         c.create_text(0, y, text="☾", font=("Segoe UI Symbol", 13), anchor="e", tags=("right", "moon"))
+        c.create_text(0, y, text="⚙  Settings", font=("Segoe UI Semibold", 11), anchor="e",
+                      tags=("right", "settings", "settings_text"))
         c.tag_bind("switch", "<Button-1>", lambda e: self._toggle_dark())
-        c.tag_bind("switch", "<Enter>", lambda e: c.configure(cursor="hand2"))
-        c.tag_bind("switch", "<Leave>", lambda e: c.configure(cursor=""))
+        c.tag_bind("settings", "<Button-1>", lambda e: self._show_settings())
+        for tag in ("switch", "settings"):
+            c.tag_bind(tag, "<Enter>", lambda e: c.configure(cursor="hand2"))
+            c.tag_bind(tag, "<Leave>", lambda e: c.configure(cursor=""))
         c.bind("<Configure>", lambda e: self._place_header())
 
     def _place_header(self):
@@ -470,6 +587,7 @@ class App(tk.Tk):
         c.coords("moon", w - 16, y - 1)
         c.coords("switch", w - 38, y)
         c.coords("sun", w - 44 - sw, y - 1)
+        c.coords("settings_text", w - 44 - sw - 44, y)
 
     def _redraw_header(self):
         p = self.theme.p
@@ -488,6 +606,7 @@ class App(tk.Tk):
         c.itemconfigure("sun", fill=p["title"] if not p["dark"] else p["subtitle"])
         c.itemconfigure("moon", fill=p["title"] if p["dark"] else p["subtitle"])
         c.itemconfigure("switch", image=self.theme.photos["switch_on" if p["dark"] else "switch_off"])
+        c.itemconfigure("settings_text", fill=p["title"])
         self._place_header()
 
     def _card(self, parent, title=None, hint=None):
@@ -529,6 +648,17 @@ class App(tk.Tk):
         for cb in self.comboboxes:
             self.theme.recolor_combobox(cb)
         self._redraw_header()
+        self._draw_drop_zone()
+        self.pv_canvas.configure(background=p["card"])
+        self._layout_thumbs()
+        self._style_mode_buttons()
+        for win in (self.settings_win, self.viewer):
+            if win and win.winfo_exists():
+                win.configure(background=p["bg"])
+                if win.winfo_viewable():
+                    set_title_bar_dark(win, dark)
+        if self.viewer and self.viewer.winfo_exists():
+            self.viewer.canvas.configure(background=p["bg"])
         set_title_bar_dark(self, dark)
 
     def _toggle_dark(self):
@@ -536,35 +666,46 @@ class App(tk.Tk):
         self._apply_theme()
 
     def _build_queue(self, parent):
-        card, box = self._card(parent, "Comics to convert",
-                               "Drag and drop folders, CBZ, ZIP, CBR, RAR or PDF files anywhere on this window")
+        card, box = self._card(parent)
         box.columnconfigure(0, weight=1)
+        box.rowconfigure(1, weight=1)
 
-        cols = ("input", "status")
-        self.tree = ttk.Treeview(box, columns=cols, show="headings", height=5, selectmode="extended")
-        self.tree.heading("input", text="Input")
+        bar = ttk.Frame(box)
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(bar, text="Comics", style="CardTitle.TLabel").pack(side="left", padx=(0, 14))
+        for txt, cmd in (("Add folders…", self._add_folder), ("Add files…", self._add_files),
+                         ("Remove", self._remove_selected), ("Clear finished", self._clear_finished),
+                         ("Clear all", self._clear_queue)):
+            ttk.Button(bar, text=txt, command=cmd).pack(side="left", padx=(0, 6))
+        ttk.Button(bar, text="Open output folder", command=self._open_output).pack(side="right")
+        self.queue_count = ttk.Label(bar, style="Muted.TLabel")
+        self.queue_count.pack(side="right", padx=(0, 12))
+
+        cols = ("input", "status", "output")
+        self.tree = ttk.Treeview(box, columns=cols, show="headings", height=6, selectmode="extended")
+        self.tree.heading("input", text="Comic (folder or file)")
         self.tree.heading("status", text="Status")
-        self.tree.column("input", width=700)
-        self.tree.column("status", width=160, anchor="center")
-        self.tree.grid(row=0, column=0, rowspan=5, sticky="nsew")
+        self.tree.heading("output", text="EPUB")
+        self.tree.column("input", width=520)
+        self.tree.column("status", width=130, anchor="center", stretch=False)
+        self.tree.column("output", width=300)
+        self.tree.grid(row=1, column=0, sticky="nsew")
         sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
-        sb.grid(row=0, column=1, rowspan=5, sticky="ns")
+        sb.grid(row=1, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.bind("<Delete>", lambda e: self._remove_selected())
+        self.tree.bind("<Double-1>", lambda e: self._preview_item(self.tree.identify_row(e.y)))
+        Tooltip(self.tree, "Double-click a comic to preview it. Drop more comics anywhere on the window. "
+                           "Delete removes the selected ones.")
 
-        btns = [("Add files…", self._add_files), ("Add folders…", self._add_folder),
-                ("Remove", self._remove_selected), ("Clear", self._clear_queue)]
-        for i, (txt, cmd) in enumerate(btns):
-            ttk.Button(box, text=txt, command=cmd, width=14).grid(row=i, column=2, padx=(10, 0), pady=2, sticky="ew")
-
-        out = ttk.Frame(box)
-        out.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        out.columnconfigure(1, weight=1)
-        ttk.Label(out, text="Output folder:").grid(row=0, column=0, sticky="w")
-        self.vars["output_dir"] = tk.StringVar()
-        ttk.Entry(out, textvariable=self.vars["output_dir"]).grid(row=0, column=1, sticky="ew", padx=6)
-        ttk.Button(out, text="Browse…", command=self._pick_output).grid(row=0, column=2)
-        ttk.Label(out, text="(empty = next to each input)", style="Muted.TLabel").grid(row=0, column=3, padx=(8, 0))
+        # Status display, in the style of an LCD, with the progress of the whole queue.
+        lcd = ttk.Frame(box, style="LCD.TFrame", padding=self.theme.padding("LCD.TFrame"))
+        lcd.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        lcd.columnconfigure(0, weight=1)
+        self.status = tk.StringVar(value="Ready")
+        ttk.Label(lcd, textvariable=self.status, style="LCD.TLabel").grid(row=0, column=0, sticky="w")
+        self.progress = ttk.Progressbar(lcd, mode="determinate", maximum=100)
+        self.progress.grid(row=1, column=0, sticky="ew", pady=(3, 0))
         return card
 
     def _build_log(self, parent):
@@ -575,7 +716,7 @@ class App(tk.Tk):
         inset.grid(row=0, column=0, sticky="nsew")
         inset.columnconfigure(0, weight=1)
         inset.rowconfigure(0, weight=1)
-        self.log = tk.Text(inset, height=6, wrap="word", font=("Consolas", 9), state="disabled",
+        self.log = tk.Text(inset, height=3, wrap="word", font=("Consolas", 9), state="disabled",
                            relief="flat", borderwidth=0, highlightthickness=0, padx=6, pady=4)
         self.log.grid(row=0, column=0, sticky="nsew")
         sb = ttk.Scrollbar(box, orient="vertical", command=self.log.yview)
@@ -583,26 +724,322 @@ class App(tk.Tk):
         self.log.configure(yscrollcommand=sb.set)
         return card
 
-    def _build_actions(self, parent):
-        card, bar = self._card(parent)
-        bar.columnconfigure(0, weight=1)
-        # Status display, in the style of an LCD.
-        lcd = ttk.Frame(bar, style="LCD.TFrame", padding=self.theme.padding("LCD.TFrame"))
-        lcd.grid(row=0, column=0, sticky="ew", padx=(0, 12))
-        lcd.columnconfigure(0, weight=1)
-        self.status = tk.StringVar(value="Ready")
-        ttk.Label(lcd, textvariable=self.status, style="LCD.TLabel").grid(row=0, column=0, sticky="w")
-        self.progress = ttk.Progressbar(lcd, mode="determinate", maximum=100)
-        self.progress.grid(row=1, column=0, sticky="ew", pady=(3, 0))
-        self.btn_cmd = ttk.Button(bar, text="Show command", command=self._show_command)
-        self.btn_cmd.grid(row=0, column=1, padx=3)
-        self.btn_dry = ttk.Button(bar, text="Dry run", command=lambda: self._start(dry=True))
-        self.btn_dry.grid(row=0, column=2, padx=3)
-        self.btn_stop = ttk.Button(bar, text="Stop", command=self._stop, state="disabled")
-        self.btn_stop.grid(row=0, column=3, padx=3)
-        self.btn_go = ttk.Button(bar, text="Convert", style="Accent.TButton", command=lambda: self._start(dry=False))
-        self.btn_go.grid(row=0, column=4, padx=(3, 0), ipadx=14, ipady=3)
+    def _build_export(self, parent):
+        """The options most used, on the right of the preview. They share their variables with the
+        Settings window: a change in one shows in the other."""
+        card, box = self._card(parent, "Export")
+        box.columnconfigure(1, weight=1)
+        rows = [0]
+
+        def row(label, widget, tip=None):
+            r = rows[0]
+            ttk.Label(box, text=label).grid(row=r, column=0, sticky="w", padx=(0, 10), pady=2)
+            widget.grid(row=r, column=1, sticky="ew", pady=2)
+            if tip:
+                Tooltip(widget, tip)
+            rows[0] += 1
+
+        def combo(key, values, command=None):
+            cb = ttk.Combobox(box, state="readonly", values=values, textvariable=self.vars[key], width=28)
+            self.comboboxes.append(cb)
+            if command:
+                cb.bind("<<ComboboxSelected>>", lambda e: command())
+            return cb
+
+        out = ttk.Frame(box)
+        out.columnconfigure(0, weight=1)
+        self.vars["output_dir"] = tk.StringVar()
+        ttk.Entry(out, textvariable=self.vars["output_dir"], width=10).grid(row=0, column=0, sticky="ew")
+        ttk.Button(out, text="…", width=3, command=self._pick_output).grid(row=0, column=1, padx=(4, 0))
+        row("Output folder", out, "Where the EPUBs go. Empty: next to each comic.")
+        row("Device", combo("profile", PROFILE_LABELS, self._on_profile_change), "The e-reader you will read on.")
+        row("Reading mode", combo("mode", [l for _, l in CHOICES["mode"]], self._on_mode_change))
+        row("Image format", combo("format", [l for _, l in CHOICES["format"]]))
+        q = ttk.Frame(box)
+        ttk.Scale(q, from_=1, to=100, variable=self.vars["quality"],
+                  command=lambda x: self.vars["quality"].set(round(float(x)))).pack(side="left", fill="x", expand=True)
+        ttk.Spinbox(q, from_=1, to=100, textvariable=self.vars["quality"], width=4).pack(side="left", padx=(6, 0))
+        row("Quality", q)
+        row("Split every (MB)", ttk.Spinbox(box, from_=0, to=10000, increment=10, textvariable=self.vars["limitmb"],
+                                            width=8), "Maximum size of each EPUB. 0 = no limit, minimum 20.")
+        row("Title page", combo("titlepage", [l for _, l in CHOICES["titlepage"]]))
+        checks = ttk.Frame(box)
+        ttk.Checkbutton(checks, text="Grayscale", variable=self.vars["grayscale"]).pack(side="left")
+        ttk.Checkbutton(checks, text="Auto contrast", variable=self.vars["autocontrast"]).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(checks, text="Crop", variable=self.vars["crop"],
+                        command=self._on_crop_change).pack(side="left", padx=(12, 0))
+        checks.grid(row=rows[0], column=0, columnspan=2, sticky="w", pady=(6, 0))
+        more = ttk.Frame(box)
+        more.grid(row=rows[0] + 1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(more, text="All settings…", command=self._show_settings).pack(side="left")
+        self.btn_cmd = ttk.Button(more, text="Command", command=self._show_command)
+        self.btn_cmd.pack(side="right")
+        self.btn_dry = ttk.Button(more, text="Dry run", command=lambda: self._start(dry=True))
+        self.btn_dry.pack(side="right", padx=6)
+        Tooltip(self.btn_dry, "Checks the options for every comic, without converting.")
+        Tooltip(self.btn_cmd, "Copies the go-comic-converter command line of these options.")
+
+        box.rowconfigure(100, weight=1)  # pushes the buttons to the bottom
+        acts = ttk.Frame(box)
+        acts.grid(row=101, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        acts.columnconfigure(0, weight=1)
+        self.btn_go = ttk.Button(acts, text="Convert all", style="Accent.TButton",
+                                 command=lambda: self._start(dry=False))
+        self.btn_go.grid(row=0, column=0, sticky="ew", ipady=5)
+        self.btn_stop = ttk.Button(acts, text="Stop", command=self._stop, state="disabled")
+        self.btn_stop.grid(row=0, column=1, sticky="ns", padx=(6, 0))
         return card
+
+    # ---------- preview ----------
+
+    THUMB_W, THUMB_H = 120, 170
+
+    def _build_preview(self, parent):
+        card, box = self._card(parent)
+        box.columnconfigure(0, weight=1)
+        box.rowconfigure(1, weight=1)
+        bar = ttk.Frame(box)
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(bar, text="Preview", style="CardTitle.TLabel").pack(side="left")
+        ttk.Button(bar, text="◀", width=3, command=lambda: self._step_preview(-1)).pack(side="left", padx=(14, 4))
+        self.pv_var = tk.StringVar()
+        self.pv_combo = ttk.Combobox(bar, state="readonly", textvariable=self.pv_var, width=46, height=20)
+        self.pv_combo.pack(side="left")
+        self.pv_combo.bind("<<ComboboxSelected>>", lambda e: self._load_preview())
+        self.comboboxes.append(self.pv_combo)
+        ttk.Button(bar, text="▶", width=3, command=lambda: self._step_preview(1)).pack(side="left", padx=4)
+        self.pv_btn_conv = ttk.Button(bar, text="Converted", command=lambda: self._set_preview_mode("converted"))
+        self.pv_btn_conv.pack(side="right")
+        self.pv_btn_orig = ttk.Button(bar, text="Original", command=lambda: self._set_preview_mode("original"))
+        self.pv_btn_orig.pack(side="right", padx=(0, 4))
+        Tooltip(self.pv_btn_orig, "The pages as they are, in the order of the EPUB.")
+        Tooltip(self.pv_btn_conv, "What the e-reader will show, with the current settings: crop, grayscale, "
+                                  "split double pages, title page... The comic is converted first.")
+
+        self.pv_canvas = tk.Canvas(box, highlightthickness=0, borderwidth=0)
+        self.pv_canvas.grid(row=1, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.pv_canvas.yview)
+        sb.grid(row=1, column=1, sticky="ns")
+        self.pv_canvas.configure(yscrollcommand=sb.set)
+        self.pv_canvas.bind("<Configure>", lambda e: self._layout_thumbs())
+        self.pv_canvas.bind("<MouseWheel>", lambda e: self.pv_canvas.yview_scroll(-e.delta // 120, "units"))
+        self.pv_info = ttk.Label(box, style="Muted.TLabel")
+        self.pv_info.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        return card
+
+    def _schedule_preview(self):
+        """Reloads the preview once the current changes are done."""
+        if self.pv_after:
+            self.after_cancel(self.pv_after)
+        self.pv_after = self.after_idle(self._load_preview)
+
+    def destroy(self):
+        if self.pv_after:
+            self.after_cancel(self.pv_after)
+            self.pv_after = None
+        super().destroy()
+
+    def _style_mode_buttons(self):
+        conv = self.pv_mode == "converted"
+        self.pv_btn_conv.configure(style="Accent.TButton" if conv else "TButton")
+        self.pv_btn_orig.configure(style="TButton" if conv else "Accent.TButton")
+
+    def _set_preview_mode(self, mode):
+        self.pv_mode = mode
+        self._style_mode_buttons()
+        self._load_preview()
+
+    def _refresh_picker(self):
+        """Lists the queue in the comic picker, keeping the comic shown when it's still there."""
+        items = list(self.tree.get_children())
+        shown = self.pv_items[self.pv_combo.current()] if self.pv_items and self.pv_combo.current() >= 0 else None
+        self.pv_items = items
+        self.pv_combo.configure(values=[f"{n}. {os.path.basename(self.tree.set(i, 'input'))}"
+                                        for n, i in enumerate(items, 1)])
+        self.queue_count.configure(text=f"{len(items)} comic{'s' if len(items) != 1 else ''}")
+        if not items:
+            self.pv_var.set("")
+            self._clear_preview()
+            return
+        if shown in items:
+            self.pv_combo.current(items.index(shown))
+        else:
+            self.pv_combo.current(0)
+            self._load_preview()
+
+    def _preview_item(self, item):
+        if item in self.pv_items:
+            self.pv_combo.current(self.pv_items.index(item))
+            self._load_preview()
+
+    def _step_preview(self, step):
+        if self.pv_items:
+            self.pv_combo.current((self.pv_combo.current() + step) % len(self.pv_items))
+            self._load_preview()
+
+    def _clear_preview(self, info=""):
+        self.pv_token += 1  # drops the results of a load still running
+        if self.pv_proc and self.pv_proc.poll() is None:
+            self.pv_proc.terminate()
+        self.pv_pages, self.pv_photos = [], {}
+        self.pv_canvas.delete("all")
+        self.pv_info.configure(text=info)
+
+    def _load_preview(self):
+        """Shows the pages of the comic selected in the picker, in a thread."""
+        self.pv_after = None
+        if not self.pv_items or self.pv_combo.current() < 0:
+            return self._clear_preview()
+        path = self.tree.set(self.pv_items[self.pv_combo.current()], "input")
+        self._clear_preview("Loading…")
+        token = self.pv_token
+        if not preview.HAVE_PIL:
+            return self.pv_info.configure(text="The preview needs Pillow (pip install pillow).")
+        exe = self._exe()
+        if self.pv_mode == "original":
+            try:
+                pages = preview.source_pages(path, self._get_choice("sort"))
+            except (OSError, ValueError) as e:  # unreadable folder or bad zip
+                return self.pv_info.configure(text=f"Can't read this comic: {e}")
+            if pages is not None:
+                return self._start_thumbs(token, pages, "")
+            # CBR/RAR and PDF: the converter extracts the pages, with no filter.
+            args = ["-ignore-config", f"-input={path}", "-profile=HR", "-nofilter", "-grayscale=0",
+                    "-titlepage=0", "-covercaption=0", "-format=jpeg", "-quality=85",
+                    f"-sort={self._get_choice('sort')}"]
+            note = "Extracted by the converter: double pages appear split."
+        else:
+            try:
+                errs = self._validate()
+                args = self._build_args(path)
+            except (tk.TclError, ValueError):
+                errs, args = ["A number field contains an invalid value"], []
+            if errs:
+                return self.pv_info.configure(text="Can't preview: " + "; ".join(errs))
+            note = "Converted with the current settings. Click Converted again after changing them."
+        if not exe:
+            return self.pv_info.configure(text="go-comic-converter was not found: see Settings > Advanced.")
+        epub = self.pv_cache.get((path, tuple(args)))
+        if epub and os.path.isfile(epub):
+            return self._start_thumbs(token, None, note, epub=epub)
+        epub = os.path.join(self.pv_tmp, f"{token}.epub")
+        # Overrides at the end: the last value of a flag wins. One EPUB, in a format Pillow reads.
+        run_args = args + [f"-output={epub}", "-limitmb=0", "-json"]
+        if self._get_choice("format") == "jxl" and self.pv_mode == "converted":
+            run_args.append("-format=jpeg")
+        self._start_thumbs(token, None, note, epub=epub, exe=exe, args=run_args, key=(path, tuple(args)))
+
+    def _start_thumbs(self, token, pages, note, epub=None, exe=None, args=None, key=None):
+        threading.Thread(target=self._preview_worker, args=(token, pages, note, epub, exe, args, key),
+                         daemon=True).start()
+
+    def _preview_worker(self, token, pages, note, epub, exe, args, key):
+        put = lambda *ev: self.events.put(("pv",) + (token,) + ev)
+        stale = lambda: token != self.pv_token
+        try:
+            if args:
+                def progress(d):
+                    p, st = d.get("epubprogress", {}), d.get("steps", {})
+                    put("info", f"Converting for the preview: {d.get('description', '')} "
+                                f"{p.get('current', 0)}/{p.get('total', 0)} (step {st.get('current', 1)}/{st.get('total', 2)})")
+                put("info", "Converting for the preview…")
+                err = preview.run_converter(exe, args, popen_kwargs(), progress, stale,
+                                            on_start=lambda proc: setattr(self, "pv_proc", proc))
+                if err:
+                    return put("info", "" if err == "cancelled" else f"Preview failed: {err}")
+                put("cached", key, epub)
+            if epub:
+                pages = preview.epub_pages(epub)
+            if stale():
+                return
+            put("pages", pages, note)
+            for i, page in enumerate(pages):
+                if stale():
+                    return
+                try:
+                    png, size = preview.thumbnail(page.load(), self.THUMB_W, self.THUMB_H)
+                except Exception:  # a page Pillow can't read (e.g. JPEG XL): left as a blank tile
+                    png = None
+                put("thumb", i, png)
+            put("done")
+        except (OSError, ValueError, KeyError, AttributeError) as e:
+            put("info", f"Preview failed: {e}")
+
+    def _on_preview_event(self, token, kind, *data):
+        if token != self.pv_token:
+            return
+        if kind == "info":
+            self.pv_info.configure(text=data[0])
+        elif kind == "cached":
+            self.pv_cache[data[0]] = data[1]
+        elif kind == "pages":
+            self.pv_pages, note = data
+            self.pv_note = note
+            self.pv_info.configure(text=f"{len(self.pv_pages)} pages - loading…  {note}")
+            self._layout_thumbs()
+        elif kind == "thumb":
+            i, png = data
+            if png:
+                self.pv_photos[i] = tk.PhotoImage(master=self, data=png)
+                self.pv_canvas.itemconfigure(f"img{i}", image=self.pv_photos[i])
+        elif kind == "done":
+            self.pv_info.configure(text=f"{len(self.pv_pages)} pages. Click a page to see it bigger.  {self.pv_note}")
+
+    def _layout_thumbs(self):
+        """Places the thumbnails in a grid as wide as the preview."""
+        c, p = self.pv_canvas, self.theme.p
+        c.delete("all")
+        if not self.pv_pages:
+            return
+        tw, th, gap, cap = self.THUMB_W, self.THUMB_H, 14, 18
+        cols = max(1, (c.winfo_width() - gap) // (tw + gap))
+        x_off = max(gap, (c.winfo_width() - cols * (tw + gap) + gap) // 2)
+        for i, page in enumerate(self.pv_pages):
+            r, col = divmod(i, cols)
+            x, y = x_off + col * (tw + gap), gap + r * (th + cap + gap)
+            tag = f"page{i}"
+            c.create_rectangle(x - 1, y - 1, x + tw + 1, y + th + 1, fill=p["field"], outline=p["field_border"],
+                               tags=(tag,))
+            c.create_image(x + tw / 2, y + th / 2, image=self.pv_photos.get(i, ""), tags=(tag, f"img{i}"))
+            c.create_text(x + tw / 2, y + th + 4, text=page.label if len(page.label) < 18 else f"{i + 1}",
+                          anchor="n", fill=p["muted"], font=("Segoe UI", 8), tags=(tag,))
+            c.tag_bind(tag, "<Button-1>", lambda e, n=i: self._open_viewer(n))
+        rows = (len(self.pv_pages) + cols - 1) // cols
+        c.configure(scrollregion=(0, 0, c.winfo_width(), gap + rows * (th + cap + gap)))
+
+    def _open_viewer(self, index):
+        """A window with one page, as big as the window; arrow keys for the next and previous."""
+        if not (self.viewer and self.viewer.winfo_exists()):
+            v = self.viewer = tk.Toplevel(self)
+            v.geometry("720x960")
+            v.configure(background=self.theme.p["bg"])
+            v.canvas = tk.Canvas(v, highlightthickness=0, borderwidth=0, background=self.theme.p["bg"])
+            v.canvas.pack(fill="both", expand=True)
+            v.bind("<Left>", lambda e: self._show_page(v.index - 1))
+            v.bind("<Right>", lambda e: self._show_page(v.index + 1))
+            v.bind("<Escape>", lambda e: v.destroy())
+            v.canvas.bind("<Configure>", lambda e: self._show_page(v.index))
+            v.index = index
+            set_title_bar_dark(v, self.theme.p["dark"])
+        self.viewer.lift()
+        self.viewer.focus_set()
+        self._show_page(index)
+
+    def _show_page(self, index):
+        v = self.viewer
+        if not self.pv_pages or not (v and v.winfo_exists()):
+            return
+        v.index = index = max(0, min(index, len(self.pv_pages) - 1))
+        page = self.pv_pages[index]
+        v.title(f"{self.pv_var.get()} - {page.label} ({index + 1}/{len(self.pv_pages)})   ← →")
+        w, h = max(v.canvas.winfo_width(), 100), max(v.canvas.winfo_height(), 100)
+        v.canvas.delete("all")
+        try:
+            png, _ = preview.thumbnail(page.load(), w, h)
+            v.photo = tk.PhotoImage(master=self, data=png)
+            v.canvas.create_image(w / 2, h / 2, image=v.photo)
+        except Exception as e:
+            v.canvas.create_text(w / 2, h / 2, text=f"Can't show this page: {e}", fill=self.theme.p["text"])
 
     # ---------- widget helpers ----------
 
@@ -869,9 +1306,10 @@ class App(tk.Tk):
         for p in sorted(paths, key=natural_key):
             p = os.path.normpath(p)
             if p not in existing:
-                self.tree.insert("", "end", values=(p, "Pending"))
+                self.tree.insert("", "end", values=(p, "Pending", ""))
                 existing.add(p)
         self._restripe()
+        self._update_view()
 
     def _restripe(self):
         """Alternate the colors of the rows of the queue."""
@@ -929,10 +1367,30 @@ class App(tk.Tk):
         for i in self.tree.selection():
             self.tree.delete(i)
         self._restripe()
+        self._update_view()
 
     def _clear_queue(self):
         if not self.worker:
             self.tree.delete(*self.tree.get_children())
+            self._update_view()
+
+    def _clear_finished(self):
+        """Removes the comics converted: what's left is what still needs work."""
+        if not self.worker:
+            self.tree.delete(*[i for i in self.tree.get_children() if self.tree.set(i, "status").startswith("Done")])
+            self._restripe()
+            self._update_view()
+
+    def _open_output(self):
+        """Opens the output folder, or the folder of the EPUB of the selected comic."""
+        folder = self.vars["output_dir"].get().strip()
+        if not folder:
+            sel = self.tree.selection() or self.tree.get_children()
+            if sel:
+                out = self.tree.set(sel[0], "output")
+                folder = os.path.dirname(out) if out else os.path.dirname(os.path.normpath(self.tree.set(sel[0], "input")))
+        if folder and os.path.isdir(folder) and os.name == "nt":
+            os.startfile(folder)
 
     def _pick_output(self):
         d = filedialog.askdirectory(parent=self, title="Output folder")
@@ -1112,6 +1570,7 @@ class App(tk.Tk):
         self._save_settings()
         for i in items:
             self.tree.set(i, "status", "Pending")
+            self.tree.set(i, "output", "")
         self.stop_requested = False
         self._set_running(True)
         self.worker = threading.Thread(target=self._work, args=(exe, jobs, dry), daemon=True)
@@ -1136,7 +1595,7 @@ class App(tk.Tk):
                 self.events.put(("item", item, "Error"))
                 continue
             for line in self.proc.stdout:
-                self._handle_line(line, outputs)
+                self._handle_line(line, outputs, item)
             code = self.proc.wait()
             self.proc = None
             if self.stop_requested:
@@ -1148,7 +1607,7 @@ class App(tk.Tk):
                 self.events.put(("item", item, f"Error ({code})"))
         self.events.put(("finished", ok, len(jobs), dry, outputs))
 
-    def _handle_line(self, line, outputs):
+    def _handle_line(self, line, outputs, item=None):
         s = line.strip()
         if s.startswith("{"):
             try:
@@ -1163,6 +1622,7 @@ class App(tk.Tk):
                     out = data.get("output")
                     if out:
                         outputs.append(out)
+                        self.events.put(("output", item, out))
                     self.events.put(("log", f"Output: {out}\n", None))
                 elif kind == "stats":
                     secs = data.get("elapse_ms", 0) / 1000
@@ -1188,8 +1648,10 @@ class App(tk.Tk):
             self.worker = None
 
     def _poll_events(self):
+        # A time budget per pass: the thumbnails of a long comic arrive faster than Tk shows them.
+        deadline = time.perf_counter() + 0.025
         try:
-            while True:
+            while time.perf_counter() < deadline:
                 ev = self.events.get_nowait()
                 kind = ev[0]
                 if kind == "log":
@@ -1199,7 +1661,7 @@ class App(tk.Tk):
                         self.tree.set(ev[1], "status", ev[2])
                 elif kind == "job":
                     self.job = (ev[1], ev[2])
-                    self.progress["value"] = 0
+                    self.progress["value"] = (ev[1] - 1) / ev[2] * 100
                     self.status.set(f"Comic {ev[1]}/{ev[2]}: starting…")
                 elif kind == "progress":
                     self._on_progress(ev[1])
@@ -1207,6 +1669,11 @@ class App(tk.Tk):
                     self._on_finished(*ev[1:])
                 elif kind == "drop":
                     self._on_drop(ev[1])
+                elif kind == "pv":
+                    self._on_preview_event(*ev[1:])
+                elif kind == "output":
+                    if ev[1] and self.tree.exists(ev[1]):
+                        self.tree.set(ev[1], "output", ev[2])
                 elif kind == "installed":
                     self.status.set("Installed" if ev[1] else "Install failed")
                     if ev[1]:
@@ -1214,17 +1681,19 @@ class App(tk.Tk):
                         self._log(f"Installed: {self.vars['exe'].get()}\n", "ok")
         except queue.Empty:
             pass
-        self.after(80, self._poll_events)
+        self.after(80 if self.events.empty() else 1, self._poll_events)
 
     def _on_progress(self, data):
         p = data.get("epubprogress", {})
         st = data.get("steps", {})
         cur, tot = p.get("current", 0), max(p.get("total", 1), 1)
         step, steps = st.get("current", 1), max(st.get("total", 1), 1)
-        # Spread the steps (processing, writing) over the bar.
-        self.progress["value"] = ((step - 1) + cur / tot) / steps * 100
         n, total = getattr(self, "job", (1, 1))
-        self.status.set(f"Comic {n}/{total}: {data.get('description', '')} {cur}/{tot}")
+        # The bar shows the whole queue; each comic is spread over its steps (processing, writing).
+        done_in_comic = ((step - 1) + cur / tot) / steps
+        self.progress["value"] = ((n - 1) + done_in_comic) / total * 100
+        self.status.set(f"Comic {n}/{total} ({round(self.progress['value'])}% of the queue): "
+                        f"{data.get('description', '')} {cur}/{tot}")
 
     def _on_finished(self, ok, total, dry, outputs):
         self._set_running(False)
@@ -1301,8 +1770,10 @@ class App(tk.Tk):
         if self.worker and not messagebox.askyesno(APP_NAME, "A conversion is running. Stop it and quit?"):
             return
         self._stop()
+        self._clear_preview()
         self._save_settings()
         self.destroy()
+        shutil.rmtree(self.pv_tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

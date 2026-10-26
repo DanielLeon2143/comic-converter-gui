@@ -15,26 +15,27 @@ installed (Windows 10 or 11). Windows SmartScreen may warn the first time, as th
 git clone --recursive https://github.com/DanielLeon2143/comic-converter-gui.git
 ```
 
-Then `python comic_converter_gui.py` (or double-click `Comic Converter.bat`). It then needs
+Then `pip install pillow` (for the page preview) and `python comic_converter_gui.py` (or double-click `Comic Converter.bat`). It then needs
 `go-comic-converter.exe` next to the script, on `PATH`, in `%USERPROFILE%\go\bin`, or set in the
 Advanced tab.
 
 ## Features
 
-- **Skeuomorphic look, light and dark**: brushed metal header, raised cards, glossy buttons, inset
-  fields, LCD status display. Dark mode with the switch at the top right, or in Advanced >
-  Appearance (Same as Windows / Light / Dark). The images of the widgets are drawn by `theme.py`.
-- **Drag and drop** comics and folders from Explorer anywhere on the window. A dropped folder that
-  contains archives asks whether to add each archive or convert the folder as one comic; other
-  files are skipped.
-- Queue of comics converted one after the other, with a status per comic and a progress bar
-- Every option of the tool: device profile, reading mode (comic/manga/webtoon), format, quality,
-  grayscale, crop, brightness/contrast, double pages, aspect ratio, zoom, colors, title page, font...
-- Quality presets (good/great/best/max/no filter)
-- Dry run, and "Show command" to copy the equivalent command line
+- **Start screen**: drop comics or folders on the window, or use *Select Folder* (several at once with
+  Ctrl/Shift-click) and *Select File*.
+- **Workspace** once comics are added:
+  - **Preview** of the pages of a comic, chosen above the preview (◀ ▶ or the list). *Original* shows
+    the pages in the exact order of the EPUB (same sort as go-comic-converter); *Converted* shows what
+    the e-reader gets with the current settings (crop, grayscale, split double pages, title page).
+    Click a page to see it bigger, arrow keys for the next one.
+  - **Export** options on the right: output folder, device, reading mode, format, quality, split size,
+    title page, grayscale, contrast, crop, and *Convert all*.
+  - **Comics** list with the status and the EPUB of each one, an overall progress bar, and the log.
+    Made for bulk conversions: hundreds of comics, *Clear finished*, *Open output folder*.
+- **Settings** (top right): every option of go-comic-converter, in tabs.
+- Skeuomorphic look, light and dark (switch at the top right, or Settings > Advanced > Appearance).
 - Options are remembered in `~/.go-comic-converter-gui.json`. By default the tool's own saved
-  config is ignored (`-ignore-config`) so the window is the only source of options; this can be
-  turned off in the Advanced tab.
+  config is ignored (`-ignore-config`), so the window is the only source of options.
 
 ## Build the EXE
 
@@ -48,7 +49,7 @@ pinned commit: `git submodule update --init` if you cloned without `--recursive`
 Needs, from `PATH` or the `GO` / `CC` environment variables:
 - [Go](https://go.dev/dl/) 1.27 or later
 - a MinGW-w64 gcc, e.g. [w64devkit](https://github.com/skeeto/w64devkit) (portable, just unzip)
-- PyInstaller: `pip install pyinstaller`
+- PyInstaller and Pillow: `pip install pyinstaller pillow`
 
 Notes:
 - The cgo build is required: the pure Go build (`-tags nocgo`) crashes at startup without

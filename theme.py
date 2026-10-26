@@ -567,6 +567,8 @@ class Theme:
         st.configure("Card.TFrame", background=p["bg"])
         st.configure("TLabel", background=p["card"], foreground=p["text"])
         st.configure("Muted.TLabel", foreground=p["muted"])
+        st.configure("Backdrop.TLabel", background=p["bg"], foreground=p["muted"])
+        st.map("Backdrop.TLabel", background=[("disabled", p["bg"]), ("active", p["bg"])])
         st.configure("CardTitle.TLabel", font=("Segoe UI Semibold", 10), foreground=p["text"])
         st.configure("LCD.TFrame", background=p["card"])
         st.configure("LCD.TLabel", background=p["lcd"], foreground=p["lcd_text"], font=("Consolas", 10, "bold"))

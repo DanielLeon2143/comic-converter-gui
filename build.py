@@ -87,6 +87,10 @@ def make_icon():
 
 
 def main():
+    try:
+        import PIL  # noqa: F401 - the page preview needs it, PyInstaller packs it from here
+    except ImportError:
+        sys.exit("Pillow not found: pip install pillow")
     BUILD.mkdir(exist_ok=True)
     exe = build_converter()
     icon = make_icon()
